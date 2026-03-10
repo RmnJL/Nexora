@@ -21,3 +21,4 @@ Signature: Rmn JL
 - Phase 1 done: HELLO/HELLO_ACK.
 - Phase 2 done: DATA/DATA_ACK.
 - Phase 3 MVP done: STREAM_OPEN, STREAM_SEND, STREAM_RECV, STREAM_CLOSE.
+- Phase 3.2 done: downstream queue with sequence chunks and duplicate-safe replay cache.

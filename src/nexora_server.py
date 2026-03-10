@@ -11,6 +11,7 @@ import argparse
 import socket
 import threading
 import time
+from collections import deque
 
 from dns_wire import (
     TYPE_A,
@@ -47,7 +48,14 @@ class SessionStore:
         with self._lock:
             sid = self._next
             self._next += 1
-            self._items[sid] = {"addr": addr, "ts": time.time(), "stream_sock": None}
+            self._items[sid] = {
+                "addr": addr,
+                "ts": time.time(),
+                "stream_sock": None,
+                "down_q": deque(),
+                "down_seq": 1,
+                "resp_cache": {},
+            }
             return sid
 
     def exists(self, sid: int) -> bool:
@@ -77,6 +85,31 @@ def _make_dns_answer(request: bytes, qtype: int, packet: bytes) -> bytes:
     if qtype == TYPE_TXT:
         return build_txt_answer(request, txt, ttl=0)
     return build_cname_answer(request, _as_labels(txt) + ".x.")
+
+
+def _cache_get(sess: dict, msg_type: int, nonce: int) -> bytes | None:
+    return sess.get("resp_cache", {}).get((msg_type, nonce))
+
+
+def _cache_put(sess: dict, msg_type: int, nonce: int, packet: bytes) -> None:
+    cache = sess.setdefault("resp_cache", {})
+    cache[(msg_type, nonce)] = packet
+    if len(cache) > 256:
+        # Trim old items in insertion order for bounded memory.
+        for k in list(cache.keys())[:64]:
+            cache.pop(k, None)
+
+
+def _enqueue_downstream(sess: dict, raw: bytes, chunk_size: int = 48) -> None:
+    if not raw:
+        return
+    q = sess.setdefault("down_q", deque())
+    seq = int(sess.get("down_seq", 1))
+    for i in range(0, len(raw), chunk_size):
+        chunk = raw[i : i + chunk_size]
+        q.append((seq, chunk))
+        seq += 1
+    sess["down_seq"] = seq
 
 
 def run_server(bind: str, port: int, zone: str) -> None:
@@ -109,11 +142,20 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 continue
 
             if packet.msg_type == TYPE_DATA and sessions.exists(packet.session_id):
+                sess = sessions.get(packet.session_id)
+                if sess is None:
+                    sock.sendto(build_servfail(data), addr)
+                    continue
+                cached = _cache_get(sess, TYPE_DATA, packet.nonce)
+                if cached is not None:
+                    sock.sendto(_make_dns_answer(data, qtype, cached), addr)
+                    continue
                 # Keep ACK payload tiny to survive strict DNS relays.
                 ack_data = b"K"
                 ack = pack_packet(
                     TYPE_DATA_ACK, packet.session_id, packet.nonce, ack_data
                 )
+                _cache_put(sess, TYPE_DATA, packet.nonce, ack)
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
 
@@ -121,6 +163,10 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 sess = sessions.get(packet.session_id)
                 if sess is None:
                     sock.sendto(build_servfail(data), addr)
+                    continue
+                cached = _cache_get(sess, TYPE_STREAM_OPEN, packet.nonce)
+                if cached is not None:
+                    sock.sendto(_make_dns_answer(data, qtype, cached), addr)
                     continue
 
                 # payload format: b"host:port"
@@ -138,6 +184,8 @@ def run_server(bind: str, port: int, zone: str) -> None:
                         except Exception:
                             pass
                     sess["stream_sock"] = stream_sock
+                    sess["down_q"] = deque()
+                    sess["down_seq"] = 1
                     ack = pack_packet(
                         TYPE_STREAM_OPEN_ACK, packet.session_id, packet.nonce, b"OK"
                     )
@@ -154,6 +202,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                     print(
                         f"[nexora-server] stream open failed session={packet.session_id}"
                     )
+                _cache_put(sess, TYPE_STREAM_OPEN, packet.nonce, ack)
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
 
@@ -161,6 +210,10 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 sess = sessions.get(packet.session_id)
                 if sess is None or sess.get("stream_sock") is None:
                     sock.sendto(build_servfail(data), addr)
+                    continue
+                cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
+                if cached is not None:
+                    sock.sendto(_make_dns_answer(data, qtype, cached), addr)
                     continue
                 st = sess["stream_sock"]
                 try:
@@ -178,16 +231,24 @@ def run_server(bind: str, port: int, zone: str) -> None:
                         except socket.timeout:
                             break
                     recv_data = b"".join(recv_chunks)
+                    _enqueue_downstream(sess, recv_data)
+                    q = sess.get("down_q", deque())
+                    if q:
+                        seq, out_chunk = q.popleft()
+                        out_payload = seq.to_bytes(2, "big") + out_chunk
+                    else:
+                        out_payload = b""
                     print(
-                        f"[nexora-server] stream send session={packet.session_id} recv={len(recv_data)}"
+                        f"[nexora-server] stream send session={packet.session_id} recv={len(recv_data)} out={len(out_payload)}"
                     )
                     ack = pack_packet(
-                        TYPE_STREAM_RECV, packet.session_id, packet.nonce, recv_data
+                        TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload
                     )
                 except Exception:
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
                     )
+                _cache_put(sess, TYPE_STREAM_SEND, packet.nonce, ack)
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
 
@@ -199,7 +260,10 @@ def run_server(bind: str, port: int, zone: str) -> None:
                     except Exception:
                         pass
                     sess["stream_sock"] = None
+                    sess["down_q"] = deque()
                 ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"K")
+                if sess is not None:
+                    _cache_put(sess, TYPE_STREAM_CLOSE, packet.nonce, ack)
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import socket
 import time
+from collections import OrderedDict
 
 from dns_wire import TYPE_A, TYPE_TXT, build_query, parse_answer_data
 from nexora_proto import (
@@ -124,7 +125,18 @@ def run_tcp_test(
     if chunk_size < 1:
         chunk_size = len(req_bytes)
 
-    recv_parts: list[bytes] = []
+    recv_parts: "OrderedDict[int, bytes]" = OrderedDict()
+
+    def _add_recv(payload: bytes) -> None:
+        if len(payload) < 2:
+            return
+        seq = int.from_bytes(payload[:2], "big")
+        body = payload[2:]
+        if not body:
+            return
+        if seq not in recv_parts:
+            recv_parts[seq] = body
+
     for idx in range(0, len(req_bytes), chunk_size):
         chunk = req_bytes[idx : idx + chunk_size]
         n2 = random_nonce()
@@ -132,8 +144,7 @@ def run_tcp_test(
         _, rp = _query_txt(server, port, zone, timeout, send_pkt, attempts, qtype)
         if rp.msg_type != TYPE_STREAM_RECV or rp.nonce != n2:
             raise RuntimeError("stream recv mismatch")
-        if rp.payload:
-            recv_parts.append(rp.payload)
+        _add_recv(rp.payload)
 
     # Pull extra downstream data with empty sends.
     empty_rounds = 0
@@ -143,8 +154,9 @@ def run_tcp_test(
         _, pr = _query_txt(server, port, zone, timeout, pull_pkt, attempts, qtype)
         if pr.msg_type != TYPE_STREAM_RECV or pr.nonce != n4:
             raise RuntimeError("stream pull mismatch")
-        if pr.payload:
-            recv_parts.append(pr.payload)
+        before = len(recv_parts)
+        _add_recv(pr.payload)
+        if len(recv_parts) > before:
             empty_rounds = 0
         else:
             empty_rounds += 1
@@ -152,7 +164,7 @@ def run_tcp_test(
                 break
         time.sleep(0.08)
 
-    recv_data = b"".join(recv_parts)
+    recv_data = b"".join(recv_parts[k] for k in sorted(recv_parts.keys()))
     decoded = recv_data.decode("utf-8", errors="replace")
     print(f"[nexora-client] stream recv ({len(recv_data)} bytes):")
     print(decoded)
