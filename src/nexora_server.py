@@ -47,19 +47,22 @@ STREAM_RECV_ROUNDS = 8
 STREAM_RECV_MAX_BYTES = 4096
 DOWNSTREAM_CHUNK_SIZE = 140
 
-# Rate limiting: max HELLO requests per IP within window.
+# Rate limiting: max HELLO requests per source IP within window.
+# NOTE: in DNS tunneling, source IP = resolver, not real client.
+# Each resolver relays traffic for many clients, so limit must be high.
 HELLO_RATE_WINDOW = 60.0   # seconds
-HELLO_RATE_LIMIT = 10      # max new sessions per IP per window
+HELLO_RATE_LIMIT = 120     # max new sessions per resolver-IP per window
 
 
 class _HelloRateLimiter:
-    """Per-IP rate limiter for HELLO requests."""
+    """Per-IP rate limiter for HELLO requests with log throttling."""
 
     def __init__(self, window: float = HELLO_RATE_WINDOW, limit: int = HELLO_RATE_LIMIT) -> None:
         self._lock = threading.Lock()
         self._window = window
         self._limit = limit
         self._buckets: dict[str, list[float]] = {}
+        self._suppressed: dict[str, int] = {}  # ip -> suppressed count
 
     def allow(self, ip: str) -> bool:
         now = time.time()
@@ -72,9 +75,17 @@ class _HelloRateLimiter:
             cutoff = now - self._window
             times[:] = [t for t in times if t > cutoff]
             if len(times) >= self._limit:
+                self._suppressed[ip] = self._suppressed.get(ip, 0) + 1
                 return False
             times.append(now)
             return True
+
+    def pop_suppressed(self) -> dict[str, int]:
+        """Return and reset suppressed counts for log throttling."""
+        with self._lock:
+            result = dict(self._suppressed)
+            self._suppressed.clear()
+        return result
 
     def cleanup(self) -> None:
         now = time.time()
@@ -246,8 +257,11 @@ def run_server(
         if now - last_cleanup >= max(5.0, cleanup_interval):
             removed = sessions.cleanup_expired()
             hello_limiter.cleanup()
+            suppressed = hello_limiter.pop_suppressed()
             if removed:
                 log.info("cleanup expired sessions=%d", removed)
+            for sip, scnt in suppressed.items():
+                log.warning("hello rate limited ip=%s suppressed=%d in last interval", sip, scnt)
             last_cleanup = now
         try:
             qid, qname, qtype = parse_query(data)
@@ -262,7 +276,6 @@ def run_server(
             packet = unpack_packet(decode_dns_data(encoded))
             if packet.msg_type == TYPE_HELLO:
                 if not hello_limiter.allow(addr[0]):
-                    log.warning("hello rate limit exceeded ip=%s", addr[0])
                     sock.sendto(build_servfail(data), addr)
                     continue
                 sid = sessions.new(addr)
@@ -374,13 +387,15 @@ def run_server(
                     _enqueue_downstream(sess, recv_data, chunk_size=DOWNSTREAM_CHUNK_SIZE)
                     q = sess.get("down_q", deque())
                     # Pack as many queued chunks as fit in one DNS response.
+                    # Each entry: [1B entry_len][2B seq][data]
                     # TXT single string: max ~255 base32 chars → ~159 raw bytes.
                     # Minus 15-byte Nexora header → ~144 bytes for payload.
                     max_payload = 144
                     out_payload = b""
                     while q:
                         seq, out_chunk = q[0]
-                        entry = seq.to_bytes(2, "big") + out_chunk
+                        entry_body = seq.to_bytes(2, "big") + out_chunk
+                        entry = bytes([len(entry_body)]) + entry_body
                         if len(out_payload) + len(entry) > max_payload:
                             break
                         q.popleft()

@@ -315,24 +315,33 @@ def _stream_close(
 
 
 def _extract_seq_chunk(payload: bytes) -> tuple[int | None, bytes]:
-    """Extract a single (seq, chunk) — kept for backward compatibility."""
-    if len(payload) < 2:
+    """Extract a single (seq, chunk) from length-prefixed format: [1B len][2B seq][data]."""
+    if len(payload) < 3:
         return None, b""
-    seq = int.from_bytes(payload[:2], "big")
-    return seq, payload[2:]
+    entry_len = payload[0]
+    if entry_len < 2 or len(payload) < 1 + entry_len:
+        return None, b""
+    seq = int.from_bytes(payload[1:3], "big")
+    return seq, payload[3:1 + entry_len]
 
 
-def _extract_seq_chunks(payload: bytes, chunk_size: int = 140) -> list[tuple[int, bytes]]:
-    """Extract multiple (seq, chunk) pairs packed in one response."""
+def _extract_seq_chunks(payload: bytes) -> list[tuple[int, bytes]]:
+    """Extract multiple (seq, chunk) pairs from length-prefixed packed response.
+
+    Format: [1B entry_len][2B seq][data] repeated.
+    """
     results: list[tuple[int, bytes]] = []
     offset = 0
-    while offset + 2 < len(payload):
+    while offset < len(payload):
+        if offset + 1 > len(payload):
+            break
+        entry_len = payload[offset]
+        offset += 1
+        if entry_len < 2 or offset + entry_len > len(payload):
+            break
         seq = int.from_bytes(payload[offset:offset + 2], "big")
-        offset += 2
-        remaining = len(payload) - offset
-        data_len = min(chunk_size, remaining)
-        data = payload[offset:offset + data_len]
-        offset += data_len
+        data = payload[offset + 2:offset + entry_len]
+        offset += entry_len
         if data:
             results.append((seq, data))
     return results
@@ -431,18 +440,16 @@ def _handle_forward_conn(
             if seq is not None and chunk and seq not in seq_map:
                 seq_map[seq] = chunk
                 got_new = True
-                # Cap seq_map size to prevent unbounded memory growth.
-                while len(seq_map) > SEQ_MAP_MAX_SIZE:
-                    seq_map.popitem(last=False)
 
-            # Also try multi-chunk parse for packed responses.
-            if not got_new and len(resp.payload) > 4:
+            # Try multi-chunk parse for packed responses with >1 entry.
+            if len(resp.payload) > (1 + 2 + len(chunk if chunk else b"")):
                 for mseq, mchunk in _extract_seq_chunks(resp.payload):
                     if mseq not in seq_map:
                         seq_map[mseq] = mchunk
                         got_new = True
-                while len(seq_map) > SEQ_MAP_MAX_SIZE:
-                    seq_map.popitem(last=False)
+
+            while len(seq_map) > SEQ_MAP_MAX_SIZE:
+                seq_map.popitem(last=False)
 
             # Flush in-order chunks to local socket
             while next_seq in seq_map:
@@ -617,17 +624,9 @@ def run_tcp_test(
     recv_parts: "OrderedDict[int, bytes]" = OrderedDict()
 
     def _add_recv(payload: bytes) -> None:
-        if len(payload) < 2:
+        if len(payload) < 3:
             return
-        # Try multi-chunk parse first.
-        chunks = _extract_seq_chunks(payload)
-        if chunks:
-            for seq, body in chunks:
-                if body and seq not in recv_parts:
-                    recv_parts[seq] = body
-        else:
-            seq = int.from_bytes(payload[:2], "big")
-            body = payload[2:]
+        for seq, body in _extract_seq_chunks(payload):
             if body and seq not in recv_parts:
                 recv_parts[seq] = body
 
