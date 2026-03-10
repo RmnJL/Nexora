@@ -81,6 +81,7 @@ install_server() {
   local zone="t1.phonexpress.ir"
   local session_ttl="900"
   local cleanup_interval="60"
+  local server_py="/root/Nexora/src/nexora_server.py"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -93,8 +94,15 @@ install_server() {
     esac
   done
 
+  if [[ -f "/root/Nexora/src/nexora_server.py" ]]; then
+    server_py="/root/Nexora/src/nexora_server.py"
+  elif [[ -f "/root/nexora/src/nexora_server.py" ]]; then
+    server_py="/root/nexora/src/nexora_server.py"
+  fi
+
   cp "${SERVER_UNIT_SRC}" "${SERVER_UNIT_DST}"
   cat > "${SERVER_ENV}" <<EOF
+NEXORA_SERVER_PY=${server_py}
 NEXORA_BIND=${bind}
 NEXORA_PORT=${port}
 NEXORA_ZONE=${zone}
@@ -125,6 +133,7 @@ install_client() {
   local target_port="8443"
   local max_conns="128"
   local stream_open_retries="5"
+  local client_py="/root/nexora/src/nexora_client.py"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -150,8 +159,15 @@ install_client() {
     esac
   done
 
+  if [[ -f "/root/nexora/src/nexora_client.py" ]]; then
+    client_py="/root/nexora/src/nexora_client.py"
+  elif [[ -f "/root/nexora/nexora_client.py" ]]; then
+    client_py="/root/nexora/nexora_client.py"
+  fi
+
   cp "${CLIENT_UNIT_SRC}" "${CLIENT_UNIT_DST}"
   cat > "${CLIENT_ENV}" <<EOF
+NEXORA_CLIENT_PY=${client_py}
 NEXORA_RESOLVERS=${resolvers}
 NEXORA_PORT=${port}
 NEXORA_ZONE=${zone}
@@ -177,9 +193,17 @@ EOF
 }
 
 show_status() {
-  systemctl --no-pager --full status nexora-server || true
+  if systemctl list-unit-files --type=service | grep -q '^nexora-server\.service'; then
+    systemctl --no-pager --full status nexora-server || true
+  else
+    echo "[easy-run] nexora-server.service is not installed on this host."
+  fi
   echo
-  systemctl --no-pager --full status nexora-client-forward || true
+  if systemctl list-unit-files --type=service | grep -q '^nexora-client-forward\.service'; then
+    systemctl --no-pager --full status nexora-client-forward || true
+  else
+    echo "[easy-run] nexora-client-forward.service is not installed on this host."
+  fi
 }
 
 show_logs() {

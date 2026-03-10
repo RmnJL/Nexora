@@ -6,7 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/nexora
+WorkingDirectory=/root/nexora/src
+Environment="NEXORA_CLIENT_PY=/root/nexora/src/nexora_client.py"
 Environment="NEXORA_RESOLVERS=185.49.84.2"
 Environment="NEXORA_PORT=53"
 Environment="NEXORA_ZONE=t1.phonexpress.ir"
@@ -26,7 +27,7 @@ Environment="NEXORA_FORWARD_TARGET_PORT=8443"
 Environment="NEXORA_FORWARD_MAX_CONNS=128"
 Environment="NEXORA_STREAM_OPEN_RETRIES=5"
 EnvironmentFile=-/etc/default/nexora-client-forward
-ExecStart=/usr/bin/python3 -u /root/nexora/nexora_client.py --server ${NEXORA_RESOLVERS} --port ${NEXORA_PORT} --zone ${NEXORA_ZONE} --qtype ${NEXORA_QTYPE} --timeout ${NEXORA_TIMEOUT} --attempts ${NEXORA_ATTEMPTS} --resolver-fail-cooldown ${NEXORA_RESOLVER_FAIL_COOLDOWN} --resolver-health-interval ${NEXORA_RESOLVER_HEALTH_INTERVAL} --resolver-switch-interval ${NEXORA_RESOLVER_SWITCH_INTERVAL} --resolver-probe-timeout ${NEXORA_RESOLVER_PROBE_TIMEOUT} --resolver-probe-qtype ${NEXORA_RESOLVER_PROBE_QTYPE} --tcp-chunk-size ${NEXORA_TCP_CHUNK_SIZE} --forward-listen-host ${NEXORA_FORWARD_LISTEN_HOST} --forward-listen-port ${NEXORA_FORWARD_LISTEN_PORT} --forward-target-host ${NEXORA_FORWARD_TARGET_HOST} --forward-target-port ${NEXORA_FORWARD_TARGET_PORT} --forward-max-conns ${NEXORA_FORWARD_MAX_CONNS} --stream-open-retries ${NEXORA_STREAM_OPEN_RETRIES}
+ExecStart=/usr/bin/python3 -u ${NEXORA_CLIENT_PY} --server ${NEXORA_RESOLVERS} --port ${NEXORA_PORT} --zone ${NEXORA_ZONE} --qtype ${NEXORA_QTYPE} --timeout ${NEXORA_TIMEOUT} --attempts ${NEXORA_ATTEMPTS} --resolver-fail-cooldown ${NEXORA_RESOLVER_FAIL_COOLDOWN} --resolver-health-interval ${NEXORA_RESOLVER_HEALTH_INTERVAL} --resolver-switch-interval ${NEXORA_RESOLVER_SWITCH_INTERVAL} --resolver-probe-timeout ${NEXORA_RESOLVER_PROBE_TIMEOUT} --resolver-probe-qtype ${NEXORA_RESOLVER_PROBE_QTYPE} --tcp-chunk-size ${NEXORA_TCP_CHUNK_SIZE} --forward-listen-host ${NEXORA_FORWARD_LISTEN_HOST} --forward-listen-port ${NEXORA_FORWARD_LISTEN_PORT} --forward-target-host ${NEXORA_FORWARD_TARGET_HOST} --forward-target-port ${NEXORA_FORWARD_TARGET_PORT} --forward-max-conns ${NEXORA_FORWARD_MAX_CONNS} --stream-open-retries ${NEXORA_STREAM_OPEN_RETRIES}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
