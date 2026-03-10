@@ -29,7 +29,11 @@
 - Per-resolver adaptive MTU.
 - Optional duplication/FEC for severe packet loss.
 
-## Security Baseline
+## Security Baseline (Planned — Not Yet Implemented)
+
+> **Note:** The following security features are planned for a future phase.
+> Phase 1 does NOT include encryption or authentication.
+> All data is currently sent as base32-encoded plaintext inside DNS queries.
 
 - Key exchange: X25519
 - Payload AEAD: XChaCha20-Poly1305

@@ -8,6 +8,8 @@ Signature: Rmn JL
 from __future__ import annotations
 
 import argparse
+import logging
+import secrets
 import socket
 import threading
 import time
@@ -37,24 +39,68 @@ from nexora_proto import (
     unpack_packet,
 )
 
-STREAM_SOCK_TIMEOUT = 0.06
-STREAM_RECV_SLICE = 128
+log = logging.getLogger("nexora-server")
+
+STREAM_SOCK_TIMEOUT = 0.5
+STREAM_RECV_SLICE = 512
 STREAM_RECV_ROUNDS = 8
-STREAM_RECV_MAX_BYTES = 1024
-DOWNSTREAM_CHUNK_SIZE = 112
+STREAM_RECV_MAX_BYTES = 4096
+DOWNSTREAM_CHUNK_SIZE = 140
+
+# Rate limiting: max HELLO requests per IP within window.
+HELLO_RATE_WINDOW = 60.0   # seconds
+HELLO_RATE_LIMIT = 10      # max new sessions per IP per window
+
+
+class _HelloRateLimiter:
+    """Per-IP rate limiter for HELLO requests."""
+
+    def __init__(self, window: float = HELLO_RATE_WINDOW, limit: int = HELLO_RATE_LIMIT) -> None:
+        self._lock = threading.Lock()
+        self._window = window
+        self._limit = limit
+        self._buckets: dict[str, list[float]] = {}
+
+    def allow(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            times = self._buckets.get(ip)
+            if times is None:
+                self._buckets[ip] = [now]
+                return True
+            # Purge timestamps outside window.
+            cutoff = now - self._window
+            times[:] = [t for t in times if t > cutoff]
+            if len(times) >= self._limit:
+                return False
+            times.append(now)
+            return True
+
+    def cleanup(self) -> None:
+        now = time.time()
+        cutoff = now - self._window
+        with self._lock:
+            stale = [ip for ip, ts in self._buckets.items() if not ts or ts[-1] <= cutoff]
+            for ip in stale:
+                del self._buckets[ip]
 
 
 class SessionStore:
     def __init__(self, session_ttl: float = 900.0) -> None:
         self._lock = threading.Lock()
-        self._next = 1
         self._session_ttl = max(30.0, session_ttl)
         self._items: dict[int, dict] = {}
 
+    def _generate_sid(self) -> int:
+        """Generate a cryptographically random session ID."""
+        while True:
+            sid = secrets.randbits(32)
+            if sid != 0 and sid not in self._items:
+                return sid
+
     def new(self, addr: tuple[str, int]) -> int:
         with self._lock:
-            sid = self._next
-            self._next += 1
+            sid = self._generate_sid()
             self._items[sid] = {
                 "addr": addr,
                 "ts": time.time(),
@@ -186,10 +232,11 @@ def run_server(
     cleanup_interval: float = 60.0,
 ) -> None:
     sessions = SessionStore(session_ttl=session_ttl)
+    hello_limiter = _HelloRateLimiter()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((bind, port))
-    print(
-        f"[nexora-server] listening on {bind}:{port} zone={zone} session_ttl={session_ttl}s"
+    log.info(
+        "listening on %s:%d zone=%s session_ttl=%ss", bind, port, zone, session_ttl
     )
     last_cleanup = time.time()
 
@@ -198,8 +245,9 @@ def run_server(
         now = time.time()
         if now - last_cleanup >= max(5.0, cleanup_interval):
             removed = sessions.cleanup_expired()
+            hello_limiter.cleanup()
             if removed:
-                print(f"[nexora-server] cleanup expired sessions={removed}")
+                log.info("cleanup expired sessions=%d", removed)
             last_cleanup = now
         try:
             qid, qname, qtype = parse_query(data)
@@ -213,12 +261,16 @@ def run_server(
 
             packet = unpack_packet(decode_dns_data(encoded))
             if packet.msg_type == TYPE_HELLO:
+                if not hello_limiter.allow(addr[0]):
+                    log.warning("hello rate limit exceeded ip=%s", addr[0])
+                    sock.sendto(build_servfail(data), addr)
+                    continue
                 sid = sessions.new(addr)
                 ack = pack_packet(TYPE_HELLO_ACK, sid, packet.nonce, b"OK")
                 answer = _make_dns_answer(data, qtype, ack)
                 sock.sendto(answer, addr)
-                print(
-                    f"[nexora-server] hello from {addr[0]}:{addr[1]} -> session={sid}"
+                log.info(
+                    "hello from %s:%d -> session=%d", addr[0], addr[1], sid
                 )
                 continue
 
@@ -272,8 +324,8 @@ def run_server(
                     ack = pack_packet(
                         TYPE_STREAM_OPEN_ACK, packet.session_id, packet.nonce, b"OK"
                     )
-                    print(
-                        f"[nexora-server] stream open session={packet.session_id} target={host}:{tport}"
+                    log.info(
+                        "stream open session=%d target=%s:%d", packet.session_id, host, tport
                     )
                 except Exception:
                     ack = pack_packet(
@@ -282,8 +334,8 @@ def run_server(
                         packet.nonce,
                         b"ER",
                     )
-                    print(
-                        f"[nexora-server] stream open failed session={packet.session_id}"
+                    log.warning(
+                        "stream open failed session=%d", packet.session_id
                     )
                 _cache_put(sess, TYPE_STREAM_OPEN, packet.nonce, ack)
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
@@ -321,18 +373,26 @@ def run_server(
                     recv_data = b"".join(recv_chunks)
                     _enqueue_downstream(sess, recv_data, chunk_size=DOWNSTREAM_CHUNK_SIZE)
                     q = sess.get("down_q", deque())
-                    if q:
-                        seq, out_chunk = q.popleft()
-                        out_payload = seq.to_bytes(2, "big") + out_chunk
-                    else:
-                        out_payload = b""
-                    print(
-                        f"[nexora-server] stream send session={packet.session_id} recv={len(recv_data)} out={len(out_payload)}"
+                    # Pack as many queued chunks as fit in one DNS response.
+                    # TXT single string: max ~255 base32 chars → ~159 raw bytes.
+                    # Minus 15-byte Nexora header → ~144 bytes for payload.
+                    max_payload = 144
+                    out_payload = b""
+                    while q:
+                        seq, out_chunk = q[0]
+                        entry = seq.to_bytes(2, "big") + out_chunk
+                        if len(out_payload) + len(entry) > max_payload:
+                            break
+                        q.popleft()
+                        out_payload += entry
+                    log.debug(
+                        "stream send session=%d recv=%d out=%d", packet.session_id, len(recv_data), len(out_payload)
                     )
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload
                     )
                 except Exception:
+                    log.debug("stream send error session=%d", packet.session_id, exc_info=True)
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
                     )
@@ -358,6 +418,7 @@ def run_server(
 
             sock.sendto(build_servfail(data), addr)
         except Exception:
+            log.debug("packet parse/handle error from %s", addr, exc_info=True)
             try:
                 sock.sendto(build_servfail(data), addr)
             except Exception:
@@ -365,6 +426,10 @@ def run_server(
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
     p = argparse.ArgumentParser(description="Nexora phase-1 server")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=53)

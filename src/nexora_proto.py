@@ -6,7 +6,7 @@ Signature: Rmn JL
 from __future__ import annotations
 
 import base64
-import random
+import secrets
 import struct
 from dataclasses import dataclass
 
@@ -64,4 +64,4 @@ def decode_dns_data(s: str) -> bytes:
 
 
 def random_nonce() -> int:
-    return random.getrandbits(32)
+    return secrets.randbits(32)

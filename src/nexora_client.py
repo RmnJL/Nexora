@@ -9,6 +9,7 @@ Signature: Rmn JL
 from __future__ import annotations
 
 import argparse
+import logging
 import socket
 import threading
 import time
@@ -32,6 +33,11 @@ from nexora_proto import (
     random_nonce,
     unpack_packet,
 )
+
+log = logging.getLogger("nexora-client")
+
+# Maximum outstanding out-of-order sequence entries before dropping oldest.
+SEQ_MAP_MAX_SIZE = 512
 
 
 def chunk_label(s: str, size: int = 50) -> str:
@@ -139,7 +145,7 @@ class ResolverSelector:
                         self._last_switch = now
                 if do_switch:
                     nxt = self.rotate_active()
-                    print(f"[nexora-client] resolver rotate -> {nxt}")
+                    log.info("resolver rotate -> %s", nxt)
                 time.sleep(max(1.0, interval_sec))
 
         t = threading.Thread(target=_loop, daemon=True)
@@ -202,6 +208,7 @@ def _query_txt(
         except Exception as e:
             last_err = e
             selector.report_failure(server)
+            log.debug("query attempt %d failed server=%s: %s", idx + 1, server, e)
             # Small jitter-like backoff to avoid resolver burst drop.
             time.sleep(0.15 * (idx + 1))
     raise TimeoutError(
@@ -226,7 +233,7 @@ def run_client(
     if pkt.nonce != nonce:
         raise RuntimeError("nonce mismatch")
     sid = pkt.session_id
-    print(f"[nexora-client] handshake ok, session_id={sid}, payload={pkt.payload!r}")
+    log.info("handshake ok, session_id=%d, payload=%r", sid, pkt.payload)
 
     # Phase-2 data exchange test
     time.sleep(0.25)
@@ -237,7 +244,7 @@ def run_client(
         raise RuntimeError("unexpected data-ack type")
     if dpkt.session_id != sid or dpkt.nonce != dnonce:
         raise RuntimeError("data-ack mismatch")
-    print(f"[nexora-client] data ack ok, payload={dpkt.payload!r}")
+    log.info("data ack ok, payload=%r", dpkt.payload)
     return sid
 
 
@@ -308,10 +315,27 @@ def _stream_close(
 
 
 def _extract_seq_chunk(payload: bytes) -> tuple[int | None, bytes]:
+    """Extract a single (seq, chunk) — kept for backward compatibility."""
     if len(payload) < 2:
         return None, b""
     seq = int.from_bytes(payload[:2], "big")
     return seq, payload[2:]
+
+
+def _extract_seq_chunks(payload: bytes, chunk_size: int = 140) -> list[tuple[int, bytes]]:
+    """Extract multiple (seq, chunk) pairs packed in one response."""
+    results: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + 2 < len(payload):
+        seq = int.from_bytes(payload[offset:offset + 2], "big")
+        offset += 2
+        remaining = len(payload) - offset
+        data_len = min(chunk_size, remaining)
+        data = payload[offset:offset + data_len]
+        offset += data_len
+        if data:
+            results.append((seq, data))
+    return results
 
 
 def _handle_forward_conn(
@@ -356,8 +380,9 @@ def _handle_forward_conn(
                 sid = None
         if sid is None:
             raise RuntimeError("stream open failed")
-        print(
-            f"[nexora-client] forward open local={client_addr[0]}:{client_addr[1]} sid={sid} target={target_host}:{target_port}"
+        log.info(
+            "forward open local=%s:%d sid=%d target=%s:%d",
+            client_addr[0], client_addr[1], sid, target_host, target_port,
         )
 
         seq_map: "OrderedDict[int, bytes]" = OrderedDict()
@@ -384,7 +409,7 @@ def _handle_forward_conn(
                     elif outbound:
                         # After local upstream bytes, keep a few fast pulls
                         # to capture delayed downstream handshake responses.
-                        eager_pulls = max(eager_pulls, 6)
+                        eager_pulls = max(eager_pulls, 12)
                 except socket.timeout:
                     outbound = b""
 
@@ -406,6 +431,18 @@ def _handle_forward_conn(
             if seq is not None and chunk and seq not in seq_map:
                 seq_map[seq] = chunk
                 got_new = True
+                # Cap seq_map size to prevent unbounded memory growth.
+                while len(seq_map) > SEQ_MAP_MAX_SIZE:
+                    seq_map.popitem(last=False)
+
+            # Also try multi-chunk parse for packed responses.
+            if not got_new and len(resp.payload) > 4:
+                for mseq, mchunk in _extract_seq_chunks(resp.payload):
+                    if mseq not in seq_map:
+                        seq_map[mseq] = mchunk
+                        got_new = True
+                while len(seq_map) > SEQ_MAP_MAX_SIZE:
+                    seq_map.popitem(last=False)
 
             # Flush in-order chunks to local socket
             while next_seq in seq_map:
@@ -437,7 +474,7 @@ def _handle_forward_conn(
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
     except Exception as e:
-        print(f"[nexora-client] forward error {client_addr}: {e}")
+        log.warning("forward error %s: %s", client_addr, e)
     finally:
         if sid is not None:
             _stream_close(sid, selector, port, zone, timeout, attempts, qtype)
@@ -470,8 +507,10 @@ def run_forward_server(
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsock.bind((listen_host, listen_port))
     lsock.listen(32)
-    print(
-        f"[nexora-client] forward server listening on {listen_host}:{listen_port} -> {target_host}:{target_port} via resolvers={','.join(selector.servers)}:{port}"
+    log.info(
+        "forward server listening on %s:%d -> %s:%d via resolvers=%s:%d",
+        listen_host, listen_port, target_host, target_port,
+        ','.join(selector.servers), port,
     )
     sem = threading.BoundedSemaphore(max(1, max_conns))
     max_per_ip = max(1, min(max(1, max_conns), max_conns_per_ip))
@@ -482,7 +521,7 @@ def run_forward_server(
         peer_ip = addr[0]
 
         if not sem.acquire(blocking=False):
-            print(f"[nexora-client] forward reject local={peer_ip}:{addr[1]} reason=max_conns")
+            log.warning("forward reject local=%s:%d reason=max_conns", peer_ip, addr[1])
             try:
                 conn.close()
             except Exception:
@@ -499,8 +538,9 @@ def run_forward_server(
 
         if not ip_ok:
             sem.release()
-            print(
-                f"[nexora-client] forward reject local={peer_ip}:{addr[1]} reason=max_conns_per_ip limit={max_per_ip}"
+            log.warning(
+                "forward reject local=%s:%d reason=max_conns_per_ip limit=%d",
+                peer_ip, addr[1], max_per_ip,
             )
             try:
                 conn.close()
@@ -568,7 +608,7 @@ def run_tcp_test(
     _, op = _query_txt(selector, port, zone, timeout, open_pkt, attempts, qtype)
     if op.msg_type != TYPE_STREAM_OPEN_ACK or op.nonce != n1 or op.payload != b"OK":
         raise RuntimeError(f"stream open failed: {op.payload!r}")
-    print("[nexora-client] stream open ok")
+    log.info("stream open ok")
 
     req_bytes = request_data.encode("utf-8")
     if chunk_size < 1:
@@ -579,12 +619,17 @@ def run_tcp_test(
     def _add_recv(payload: bytes) -> None:
         if len(payload) < 2:
             return
-        seq = int.from_bytes(payload[:2], "big")
-        body = payload[2:]
-        if not body:
-            return
-        if seq not in recv_parts:
-            recv_parts[seq] = body
+        # Try multi-chunk parse first.
+        chunks = _extract_seq_chunks(payload)
+        if chunks:
+            for seq, body in chunks:
+                if body and seq not in recv_parts:
+                    recv_parts[seq] = body
+        else:
+            seq = int.from_bytes(payload[:2], "big")
+            body = payload[2:]
+            if body and seq not in recv_parts:
+                recv_parts[seq] = body
 
     for idx in range(0, len(req_bytes), chunk_size):
         chunk = req_bytes[idx : idx + chunk_size]
@@ -615,19 +660,22 @@ def run_tcp_test(
 
     recv_data = b"".join(recv_parts[k] for k in sorted(recv_parts.keys()))
     decoded = recv_data.decode("utf-8", errors="replace")
-    print(f"[nexora-client] stream recv ({len(recv_data)} bytes):")
-    print(decoded)
+    log.info("stream recv (%d bytes):\n%s", len(recv_data), decoded)
 
     n3 = random_nonce()
     close_pkt = pack_packet(TYPE_STREAM_CLOSE, sid, n3, b"")
     _, cp = _query_txt(selector, port, zone, timeout, close_pkt, attempts, qtype)
     if cp.msg_type != TYPE_STREAM_CLOSE or cp.nonce != n3:
         raise RuntimeError("stream close mismatch")
-    print("[nexora-client] stream close ok")
+    log.info("stream close ok")
     return sid
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
     p = argparse.ArgumentParser(description="Nexora phase-1 client")
     p.add_argument(
         "--server",
@@ -656,13 +704,13 @@ def main() -> None:
     p.add_argument(
         "--forward-poll-min-interval",
         type=float,
-        default=0.12,
+        default=0.05,
         help="minimum delay between empty downstream polls (seconds)",
     )
     p.add_argument(
         "--forward-poll-max-interval",
         type=float,
-        default=1.2,
+        default=0.8,
         help="maximum delay between empty downstream polls under idle pressure (seconds)",
     )
     p.add_argument(
@@ -701,8 +749,9 @@ def main() -> None:
             interval_sec=args.resolver_health_interval,
             switch_sec=args.resolver_switch_interval,
         )
-        print(
-            f"[nexora-client] resolver loop active={selector.active} list={','.join(selector.servers)}"
+        log.info(
+            "resolver loop active=%s list=%s",
+            selector.active, ','.join(selector.servers),
         )
     if args.forward_listen_port > 0 and args.forward_target_host and args.forward_target_port > 0:
         run_forward_server(

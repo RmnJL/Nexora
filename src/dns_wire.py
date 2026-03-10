@@ -5,7 +5,7 @@ Signature: Rmn JL
 
 from __future__ import annotations
 
-import random
+import secrets
 import struct
 from typing import Tuple
 
@@ -68,7 +68,7 @@ def _decode_name(packet: bytes, offset: int) -> Tuple[str, int]:
 
 
 def build_query(name: str, qtype: int = TYPE_TXT) -> tuple[int, bytes]:
-    qid = random.getrandbits(16)
+    qid = secrets.randbits(16)
     header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
     q = _encode_name(name) + struct.pack(">HH", qtype, CLASS_IN)
     return qid, header + q
