@@ -22,7 +22,9 @@ sudo bash deploy/easy-run.sh client \
   --resolvers 185.49.84.2,91.92.209.5,91.92.209.194 \
   --listen-port 1443 \
   --target-host 127.0.0.1 \
-  --target-port 8443
+  --target-port 8443 \
+  --poll-min-interval 0.12 \
+  --idle-timeout 25
 ```
 
 Status and logs:

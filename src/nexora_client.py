@@ -328,6 +328,8 @@ def _handle_forward_conn(
     target_port: int,
     chunk_size: int,
     stream_open_retries: int,
+    poll_min_interval: float,
+    idle_timeout: float,
 ) -> None:
     sid = None
     try:
@@ -362,8 +364,14 @@ def _handle_forward_conn(
         next_seq = 1
         local_closed = False
         idle_rounds = 0
+        last_activity = time.time()
+        next_pull_at = 0.0
 
         while True:
+            now = time.time()
+            if idle_timeout > 0 and now - last_activity >= idle_timeout:
+                break
+
             outbound = b""
             if not local_closed:
                 try:
@@ -372,6 +380,13 @@ def _handle_forward_conn(
                         local_closed = True
                 except socket.timeout:
                     outbound = b""
+
+            # Do not hammer resolvers with tight empty polling loops.
+            now = time.time()
+            should_poll = bool(outbound) or local_closed or now >= next_pull_at
+            if not should_poll:
+                time.sleep(min(0.05, max(0.0, next_pull_at - now)))
+                continue
 
             nonce = random_nonce()
             pkt = pack_packet(TYPE_STREAM_SEND, sid, nonce, outbound)
@@ -397,8 +412,10 @@ def _handle_forward_conn(
 
             if got_new or outbound:
                 idle_rounds = 0
+                last_activity = time.time()
             else:
                 idle_rounds += 1
+                next_pull_at = time.time() + max(0.02, poll_min_interval)
 
             if local_closed and idle_rounds >= 3:
                 break
@@ -430,6 +447,8 @@ def run_forward_server(
     chunk_size: int,
     max_conns: int,
     stream_open_retries: int,
+    poll_min_interval: float,
+    idle_timeout: float,
 ) -> None:
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -465,6 +484,8 @@ def run_forward_server(
                     target_port,
                     chunk_size,
                     stream_open_retries,
+                    poll_min_interval,
+                    idle_timeout,
                 )
             finally:
                 sem.release()
@@ -581,6 +602,18 @@ def main() -> None:
     p.add_argument("--forward-target-port", type=int, default=0)
     p.add_argument("--forward-max-conns", type=int, default=24)
     p.add_argument("--stream-open-retries", type=int, default=3)
+    p.add_argument(
+        "--forward-poll-min-interval",
+        type=float,
+        default=0.12,
+        help="minimum delay between empty downstream polls (seconds)",
+    )
+    p.add_argument(
+        "--forward-idle-timeout",
+        type=float,
+        default=25.0,
+        help="close forward stream after this many idle seconds; 0 disables",
+    )
     p.add_argument("--resolver-fail-cooldown", type=float, default=20.0)
     p.add_argument("--resolver-health-interval", type=float, default=90.0)
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
@@ -629,6 +662,8 @@ def main() -> None:
             args.tcp_chunk_size,
             args.forward_max_conns,
             args.stream_open_retries,
+            args.forward_poll_min_interval,
+            args.forward_idle_timeout,
         )
     elif args.tcp_test_host:
         run_tcp_test(
