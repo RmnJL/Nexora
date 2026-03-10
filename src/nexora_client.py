@@ -120,12 +120,25 @@ def _stream_open(
     qtype: int,
     target_host: str,
     target_port: int,
+    open_retries: int = 1,
+    retry_delay: float = 0.2,
 ) -> None:
-    n = random_nonce()
-    op = pack_packet(TYPE_STREAM_OPEN, sid, n, f"{target_host}:{target_port}".encode("ascii"))
-    _, rp = _query_txt(server, port, zone, timeout, op, attempts, qtype)
-    if rp.msg_type != TYPE_STREAM_OPEN_ACK or rp.nonce != n or rp.payload != b"OK":
-        raise RuntimeError("stream open failed")
+    last_err: Exception | None = None
+    for idx in range(max(1, open_retries)):
+        n = random_nonce()
+        try:
+            op = pack_packet(
+                TYPE_STREAM_OPEN, sid, n, f"{target_host}:{target_port}".encode("ascii")
+            )
+            _, rp = _query_txt(server, port, zone, timeout, op, attempts, qtype)
+            if rp.msg_type == TYPE_STREAM_OPEN_ACK and rp.nonce == n and rp.payload == b"OK":
+                return
+            last_err = RuntimeError(f"stream open failed: {rp.payload!r}")
+        except Exception as e:
+            last_err = e
+        if idx + 1 < open_retries:
+            time.sleep(retry_delay * (idx + 1))
+    raise RuntimeError(str(last_err) if last_err else "stream open failed")
 
 
 def _stream_close(
@@ -166,22 +179,33 @@ def _handle_forward_conn(
     target_host: str,
     target_port: int,
     chunk_size: int,
+    stream_open_retries: int,
 ) -> None:
     sid = None
     try:
         local_conn.settimeout(0.05)
-        sid = _establish_session(server, port, zone, timeout, attempts, qtype)
-        _stream_open(
-            sid,
-            server,
-            port,
-            zone,
-            timeout,
-            attempts,
-            qtype,
-            target_host,
-            target_port,
-        )
+        # Create a fresh session and retry stream-open a few times.
+        for _ in range(max(1, stream_open_retries)):
+            sid = _establish_session(server, port, zone, timeout, attempts, qtype)
+            try:
+                _stream_open(
+                    sid,
+                    server,
+                    port,
+                    zone,
+                    timeout,
+                    attempts,
+                    qtype,
+                    target_host,
+                    target_port,
+                    open_retries=2,
+                )
+                break
+            except Exception:
+                _stream_close(sid, server, port, zone, timeout, attempts, qtype)
+                sid = None
+        if sid is None:
+            raise RuntimeError("stream open failed")
         print(
             f"[nexora-client] forward open local={client_addr[0]}:{client_addr[1]} sid={sid} target={target_host}:{target_port}"
         )
@@ -215,7 +239,12 @@ def _handle_forward_conn(
 
             # Flush in-order chunks to local socket
             while next_seq in seq_map:
-                local_conn.sendall(seq_map.pop(next_seq))
+                chunk = seq_map.pop(next_seq)
+                try:
+                    local_conn.sendall(chunk)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    local_closed = True
+                    break
                 next_seq += 1
 
             if got_new or outbound:
@@ -226,6 +255,8 @@ def _handle_forward_conn(
             if local_closed and idle_rounds >= 3:
                 break
 
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
     except Exception as e:
         print(f"[nexora-client] forward error {client_addr}: {e}")
     finally:
@@ -249,6 +280,8 @@ def run_forward_server(
     target_host: str,
     target_port: int,
     chunk_size: int,
+    max_conns: int,
+    stream_open_retries: int,
 ) -> None:
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -257,23 +290,39 @@ def run_forward_server(
     print(
         f"[nexora-client] forward server listening on {listen_host}:{listen_port} -> {target_host}:{target_port} via {server}:{port}"
     )
+    sem = threading.BoundedSemaphore(max(1, max_conns))
     while True:
         conn, addr = lsock.accept()
+
+        if not sem.acquire(blocking=False):
+            print(f"[nexora-client] forward reject local={addr[0]}:{addr[1]} reason=max_conns")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+
+        def _worker() -> None:
+            try:
+                _handle_forward_conn(
+                    conn,
+                    addr,
+                    server,
+                    port,
+                    zone,
+                    timeout,
+                    attempts,
+                    qtype,
+                    target_host,
+                    target_port,
+                    chunk_size,
+                    stream_open_retries,
+                )
+            finally:
+                sem.release()
+
         t = threading.Thread(
-            target=_handle_forward_conn,
-            args=(
-                conn,
-                addr,
-                server,
-                port,
-                zone,
-                timeout,
-                attempts,
-                qtype,
-                target_host,
-                target_port,
-                chunk_size,
-            ),
+            target=_worker,
             daemon=True,
         )
         t.start()
@@ -378,6 +427,8 @@ def main() -> None:
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
     p.add_argument("--forward-target-port", type=int, default=0)
+    p.add_argument("--forward-max-conns", type=int, default=24)
+    p.add_argument("--stream-open-retries", type=int, default=3)
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     if args.forward_listen_port > 0 and args.forward_target_host and args.forward_target_port > 0:
@@ -393,6 +444,8 @@ def main() -> None:
             args.forward_target_host,
             args.forward_target_port,
             args.tcp_chunk_size,
+            args.forward_max_conns,
+            args.stream_open_retries,
         )
     elif args.tcp_test_host:
         run_tcp_test(
