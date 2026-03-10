@@ -10,6 +10,8 @@ import struct
 from typing import Tuple
 
 TYPE_TXT = 16
+TYPE_A = 1
+TYPE_CNAME = 5
 CLASS_IN = 1
 
 
@@ -65,10 +67,10 @@ def _decode_name(packet: bytes, offset: int) -> Tuple[str, int]:
     return ".".join(labels), next_offset
 
 
-def build_txt_query(name: str) -> tuple[int, bytes]:
+def build_query(name: str, qtype: int = TYPE_TXT) -> tuple[int, bytes]:
     qid = random.getrandbits(16)
     header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
-    q = _encode_name(name) + struct.pack(">HH", TYPE_TXT, CLASS_IN)
+    q = _encode_name(name) + struct.pack(">HH", qtype, CLASS_IN)
     return qid, header + q
 
 
@@ -85,7 +87,7 @@ def parse_query(packet: bytes) -> tuple[int, str, int]:
     return qid, name, qtype
 
 
-def parse_txt_answer(packet: bytes, expected_qid: int) -> str:
+def parse_answer_data(packet: bytes, expected_qid: int) -> str:
     if len(packet) < 12:
         raise ValueError("short dns answer")
     qid, _flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", packet[:12])
@@ -102,15 +104,23 @@ def parse_txt_answer(packet: bytes, expected_qid: int) -> str:
         raise ValueError("short rr header")
     atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", packet[off : off + 10])
     off += 10
-    if atype != TYPE_TXT or off + rdlen > len(packet):
-        raise ValueError("bad txt answer")
-    rdata = packet[off : off + rdlen]
-    if not rdata:
-        return ""
-    txt_len = rdata[0]
-    if txt_len + 1 > len(rdata):
-        raise ValueError("bad txt len")
-    return rdata[1 : 1 + txt_len].decode("ascii", errors="ignore")
+    if off + rdlen > len(packet):
+        raise ValueError("bad answer rdata")
+
+    if atype == TYPE_TXT:
+        rdata = packet[off : off + rdlen]
+        if not rdata:
+            return ""
+        txt_len = rdata[0]
+        if txt_len + 1 > len(rdata):
+            raise ValueError("bad txt len")
+        return rdata[1 : 1 + txt_len].decode("ascii", errors="ignore")
+
+    if atype == TYPE_CNAME:
+        cname, _ = _decode_name(packet, off)
+        return cname
+
+    raise ValueError(f"unsupported answer type: {atype}")
 
 
 def build_servfail(request: bytes) -> bytes:
@@ -134,3 +144,14 @@ def build_txt_answer(request: bytes, txt_data: str, ttl: int = 0) -> bytes:
     rdata = bytes([len(txt_data)]) + txt_data.encode("ascii")
     return qid + flags + counts + qsec + name_ptr + rr_hdr + rdata
 
+
+def build_cname_answer(request: bytes, cname_target: str, ttl: int = 0) -> bytes:
+    qid = request[:2]
+    flags = struct.pack(">H", 0x8180)
+    counts = struct.pack(">HHHH", 1, 1, 0, 0)
+    _qname, off = _decode_name(request, 12)
+    qsec = request[12 : off + 4]
+    name_ptr = struct.pack(">H", 0xC00C)
+    encoded_cname = _encode_name(cname_target)
+    rr_hdr = struct.pack(">HHIH", TYPE_CNAME, CLASS_IN, ttl, len(encoded_cname))
+    return qid + flags + counts + qsec + name_ptr + rr_hdr + encoded_cname

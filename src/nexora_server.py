@@ -12,7 +12,14 @@ import socket
 import threading
 import time
 
-from dns_wire import TYPE_TXT, build_servfail, build_txt_answer, parse_query
+from dns_wire import (
+    TYPE_A,
+    TYPE_TXT,
+    build_cname_answer,
+    build_servfail,
+    build_txt_answer,
+    parse_query,
+)
 from nexora_proto import (
     TYPE_DATA,
     TYPE_DATA_ACK,
@@ -52,6 +59,10 @@ def _extract_encoded_chunk(qname: str, zone: str) -> str:
     return head.replace(".", "")
 
 
+def _as_labels(s: str, size: int = 50) -> str:
+    return ".".join(s[i : i + size] for i in range(0, len(s), size))
+
+
 def run_server(bind: str, port: int, zone: str) -> None:
     sessions = SessionStore()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,7 +73,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
         data, addr = sock.recvfrom(4096)
         try:
             qid, qname, qtype = parse_query(data)
-            if qtype != TYPE_TXT:
+            if qtype not in (TYPE_TXT, TYPE_A):
                 sock.sendto(build_servfail(data), addr)
                 continue
             encoded = _extract_encoded_chunk(qname, zone)
@@ -75,7 +86,10 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 sid = sessions.new(addr)
                 ack = pack_packet(TYPE_HELLO_ACK, sid, packet.nonce, b"OK")
                 txt = encode_dns_data(ack)
-                answer = build_txt_answer(data, txt, ttl=0)
+                if qtype == TYPE_TXT:
+                    answer = build_txt_answer(data, txt, ttl=0)
+                else:
+                    answer = build_cname_answer(data, _as_labels(txt) + ".nexora.")
                 sock.sendto(answer, addr)
                 print(
                     f"[nexora-server] hello from {addr[0]}:{addr[1]} -> session={sid}"
@@ -89,7 +103,10 @@ def run_server(bind: str, port: int, zone: str) -> None:
                     TYPE_DATA_ACK, packet.session_id, packet.nonce, ack_data
                 )
                 txt = encode_dns_data(ack)
-                answer = build_txt_answer(data, txt, ttl=0)
+                if qtype == TYPE_TXT:
+                    answer = build_txt_answer(data, txt, ttl=0)
+                else:
+                    answer = build_cname_answer(data, _as_labels(txt) + ".nexora.")
                 sock.sendto(answer, addr)
                 continue
 
