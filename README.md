@@ -92,6 +92,7 @@ For always-on operation with automatic restart after crash/reboot, use the inclu
 
 - `deploy/systemd/nexora-server.service`
 - `deploy/systemd/nexora-client-forward.service`
+- `deploy/easy-run.sh` (one-command setup helper)
 
 They support override values from:
 

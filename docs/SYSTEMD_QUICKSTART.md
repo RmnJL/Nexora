@@ -2,6 +2,37 @@
 
 This guide keeps Nexora running continuously with automatic restart.
 
+## Easy Run (recommended)
+
+Use one command instead of manual unit/env editing.
+
+Outside server:
+
+```bash
+cd /root/Nexora
+sudo bash deploy/easy-run.sh server --zone t1.phonexpress.ir
+```
+
+Inside server:
+
+```bash
+cd /root/nexora
+sudo bash deploy/easy-run.sh client \
+  --zone t1.phonexpress.ir \
+  --resolvers 185.49.84.2,91.92.209.5,91.92.209.194 \
+  --listen-port 1443 \
+  --target-host 127.0.0.1 \
+  --target-port 8443
+```
+
+Status and logs:
+
+```bash
+sudo bash deploy/easy-run.sh status
+sudo bash deploy/easy-run.sh logs client
+sudo bash deploy/easy-run.sh logs server
+```
+
 ## 1) Outside server (`nexora-server`)
 
 Copy unit file and create env override:
