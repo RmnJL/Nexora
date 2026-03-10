@@ -50,27 +50,35 @@ class ResolverSelector:
         self._servers = uniq
         self._fail_cooldown = max(1.0, fail_cooldown)
         self._lock = Lock()
-        self._idx = 0
         self._active = uniq[0]
         self._probe_idx = 0
         self._last_switch = time.time()
         self._health_thread_started = False
         self._fails: dict[str, int] = {s: 0 for s in uniq}
         self._bad_until: dict[str, float] = {s: 0.0 for s in uniq}
+        self._order: dict[str, int] = {s: i for i, s in enumerate(uniq)}
+
+    def _preferred_server_locked(self, now: float) -> str:
+        good = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
+        pool = good or self._servers
+        return min(
+            pool,
+            key=lambda s: (
+                self._fails.get(s, 0),
+                self._bad_until.get(s, 0.0),
+                self._order.get(s, 0),
+            ),
+        )
 
     def choose(self) -> str:
         now = time.time()
         with self._lock:
-            if now >= self._bad_until.get(self._active, 0.0):
-                return self._active
-            n = len(self._servers)
-            start = self._idx % n
-            self._idx = (self._idx + 1) % n
-            for i in range(n):
-                s = self._servers[(start + i) % n]
-                if now >= self._bad_until[s]:
-                    self._active = s
-                    return s
+            preferred = self._preferred_server_locked(now)
+            active_bad = now < self._bad_until.get(self._active, 0.0)
+            active_fails = self._fails.get(self._active, 0)
+            pref_fails = self._fails.get(preferred, 0)
+            if active_bad or pref_fails + 1 < active_fails:
+                self._active = preferred
             return self._active
 
     def report_success(self, server: str) -> None:
@@ -86,21 +94,12 @@ class ResolverSelector:
             cooldown = self._fail_cooldown * min(f, 6)
             self._bad_until[server] = now + cooldown
             if server == self._active:
-                for s in self._servers:
-                    if now >= self._bad_until.get(s, 0.0):
-                        self._active = s
-                        break
+                self._active = self._preferred_server_locked(now)
 
     def rotate_active(self) -> str:
         now = time.time()
         with self._lock:
-            good = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
-            pool = good or self._servers
-            if self._active in pool:
-                idx = (pool.index(self._active) + 1) % len(pool)
-            else:
-                idx = 0
-            self._active = pool[idx]
+            self._active = self._preferred_server_locked(now)
             return self._active
 
     def start_background_health_loop(
@@ -329,6 +328,7 @@ def _handle_forward_conn(
     chunk_size: int,
     stream_open_retries: int,
     poll_min_interval: float,
+    poll_max_interval: float,
     idle_timeout: float,
 ) -> None:
     sid = None
@@ -365,7 +365,10 @@ def _handle_forward_conn(
         local_closed = False
         idle_rounds = 0
         last_activity = time.time()
-        next_pull_at = 0.0
+        poll_wait = max(0.02, poll_min_interval)
+        poll_ceiling = max(poll_wait, poll_max_interval)
+        eager_pulls = 0
+        next_pull_at = time.time()
 
         while True:
             now = time.time()
@@ -378,12 +381,16 @@ def _handle_forward_conn(
                     outbound = local_conn.recv(chunk_size)
                     if outbound == b"":
                         local_closed = True
+                    elif outbound:
+                        # After local upstream bytes, keep a few fast pulls
+                        # to capture delayed downstream handshake responses.
+                        eager_pulls = max(eager_pulls, 6)
                 except socket.timeout:
                     outbound = b""
 
             # Do not hammer resolvers with tight empty polling loops.
             now = time.time()
-            should_poll = bool(outbound) or local_closed or now >= next_pull_at
+            should_poll = bool(outbound) or now >= next_pull_at
             if not should_poll:
                 time.sleep(min(0.05, max(0.0, next_pull_at - now)))
                 continue
@@ -413,9 +420,16 @@ def _handle_forward_conn(
             if got_new or outbound:
                 idle_rounds = 0
                 last_activity = time.time()
+                poll_wait = max(0.02, poll_min_interval)
+                next_pull_at = time.time() + poll_wait
             else:
                 idle_rounds += 1
-                next_pull_at = time.time() + max(0.02, poll_min_interval)
+                if eager_pulls > 0:
+                    eager_pulls -= 1
+                    poll_wait = max(0.02, poll_min_interval)
+                else:
+                    poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
+                next_pull_at = time.time() + poll_wait
 
             if local_closed and idle_rounds >= 3:
                 break
@@ -446,8 +460,10 @@ def run_forward_server(
     target_port: int,
     chunk_size: int,
     max_conns: int,
+    max_conns_per_ip: int,
     stream_open_retries: int,
     poll_min_interval: float,
+    poll_max_interval: float,
     idle_timeout: float,
 ) -> None:
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -458,22 +474,49 @@ def run_forward_server(
         f"[nexora-client] forward server listening on {listen_host}:{listen_port} -> {target_host}:{target_port} via resolvers={','.join(selector.servers)}:{port}"
     )
     sem = threading.BoundedSemaphore(max(1, max_conns))
+    max_per_ip = max(1, min(max(1, max_conns), max_conns_per_ip))
+    ip_counts: dict[str, int] = {}
+    ip_lock = Lock()
     while True:
         conn, addr = lsock.accept()
+        peer_ip = addr[0]
 
         if not sem.acquire(blocking=False):
-            print(f"[nexora-client] forward reject local={addr[0]}:{addr[1]} reason=max_conns")
+            print(f"[nexora-client] forward reject local={peer_ip}:{addr[1]} reason=max_conns")
             try:
                 conn.close()
             except Exception:
                 pass
             continue
 
-        def _worker() -> None:
+        with ip_lock:
+            ip_n = ip_counts.get(peer_ip, 0)
+            if ip_n >= max_per_ip:
+                ip_ok = False
+            else:
+                ip_counts[peer_ip] = ip_n + 1
+                ip_ok = True
+
+        if not ip_ok:
+            sem.release()
+            print(
+                f"[nexora-client] forward reject local={peer_ip}:{addr[1]} reason=max_conns_per_ip limit={max_per_ip}"
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+
+        def _worker(
+            local_conn: socket.socket = conn,
+            local_addr: tuple[str, int] = addr,
+            local_peer_ip: str = peer_ip,
+        ) -> None:
             try:
                 _handle_forward_conn(
-                    conn,
-                    addr,
+                    local_conn,
+                    local_addr,
                     selector,
                     port,
                     zone,
@@ -485,9 +528,16 @@ def run_forward_server(
                     chunk_size,
                     stream_open_retries,
                     poll_min_interval,
+                    poll_max_interval,
                     idle_timeout,
                 )
             finally:
+                with ip_lock:
+                    cur = ip_counts.get(local_peer_ip, 0) - 1
+                    if cur > 0:
+                        ip_counts[local_peer_ip] = cur
+                    else:
+                        ip_counts.pop(local_peer_ip, None)
                 sem.release()
 
         t = threading.Thread(
@@ -601,12 +651,19 @@ def main() -> None:
     p.add_argument("--forward-target-host", default="")
     p.add_argument("--forward-target-port", type=int, default=0)
     p.add_argument("--forward-max-conns", type=int, default=24)
+    p.add_argument("--forward-max-conns-per-ip", type=int, default=64)
     p.add_argument("--stream-open-retries", type=int, default=3)
     p.add_argument(
         "--forward-poll-min-interval",
         type=float,
         default=0.12,
         help="minimum delay between empty downstream polls (seconds)",
+    )
+    p.add_argument(
+        "--forward-poll-max-interval",
+        type=float,
+        default=1.2,
+        help="maximum delay between empty downstream polls under idle pressure (seconds)",
     )
     p.add_argument(
         "--forward-idle-timeout",
@@ -661,8 +718,10 @@ def main() -> None:
             args.forward_target_port,
             args.tcp_chunk_size,
             args.forward_max_conns,
+            args.forward_max_conns_per_ip,
             args.stream_open_retries,
             args.forward_poll_min_interval,
+            args.forward_poll_max_interval,
             args.forward_idle_timeout,
         )
     elif args.tcp_test_host:

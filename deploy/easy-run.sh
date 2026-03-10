@@ -56,8 +56,10 @@ Client options:
   --target-host IP           default: 127.0.0.1
   --target-port PORT         default: 8443
   --max-conns N              default: 128
+  --max-conns-per-ip N       default: 64
   --stream-open-retries N    default: 5
   --poll-min-interval SEC    default: 0.12
+  --poll-max-interval SEC    default: 1.2
   --idle-timeout SEC         default: 25
 EOF
 }
@@ -134,8 +136,10 @@ install_client() {
   local target_host="127.0.0.1"
   local target_port="8443"
   local max_conns="128"
+  local max_conns_per_ip="64"
   local stream_open_retries="5"
   local poll_min_interval="0.12"
+  local poll_max_interval="1.2"
   local idle_timeout="25"
   local client_py="/root/nexora/src/nexora_client.py"
 
@@ -158,8 +162,10 @@ install_client() {
       --target-host) target_host="${2:?}"; shift 2 ;;
       --target-port) target_port="${2:?}"; shift 2 ;;
       --max-conns) max_conns="${2:?}"; shift 2 ;;
+      --max-conns-per-ip) max_conns_per_ip="${2:?}"; shift 2 ;;
       --stream-open-retries) stream_open_retries="${2:?}"; shift 2 ;;
       --poll-min-interval) poll_min_interval="${2:?}"; shift 2 ;;
+      --poll-max-interval) poll_max_interval="${2:?}"; shift 2 ;;
       --idle-timeout) idle_timeout="${2:?}"; shift 2 ;;
       *) echo "Unknown option for client: $1"; usage; exit 1 ;;
     esac
@@ -191,8 +197,10 @@ NEXORA_FORWARD_LISTEN_PORT=${listen_port}
 NEXORA_FORWARD_TARGET_HOST=${target_host}
 NEXORA_FORWARD_TARGET_PORT=${target_port}
 NEXORA_FORWARD_MAX_CONNS=${max_conns}
+NEXORA_FORWARD_MAX_CONNS_PER_IP=${max_conns_per_ip}
 NEXORA_STREAM_OPEN_RETRIES=${stream_open_retries}
 NEXORA_FORWARD_POLL_MIN_INTERVAL=${poll_min_interval}
+NEXORA_FORWARD_POLL_MAX_INTERVAL=${poll_max_interval}
 NEXORA_FORWARD_IDLE_TIMEOUT=${idle_timeout}
 EOF
   echo "[easy-run] installed ${CLIENT_UNIT_DST}"

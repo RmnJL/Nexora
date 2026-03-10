@@ -23,7 +23,10 @@ sudo bash deploy/easy-run.sh client \
   --listen-port 1443 \
   --target-host 127.0.0.1 \
   --target-port 8443 \
+  --max-conns 192 \
+  --max-conns-per-ip 64 \
   --poll-min-interval 0.12 \
+  --poll-max-interval 1.2 \
   --idle-timeout 25
 ```
 
@@ -88,7 +91,11 @@ NEXORA_FORWARD_LISTEN_PORT=1443
 NEXORA_FORWARD_TARGET_HOST=127.0.0.1
 NEXORA_FORWARD_TARGET_PORT=8443
 NEXORA_FORWARD_MAX_CONNS=128
+NEXORA_FORWARD_MAX_CONNS_PER_IP=64
 NEXORA_STREAM_OPEN_RETRIES=5
+NEXORA_FORWARD_POLL_MIN_INTERVAL=0.12
+NEXORA_FORWARD_POLL_MAX_INTERVAL=1.2
+NEXORA_FORWARD_IDLE_TIMEOUT=25
 EOF
 ```
 

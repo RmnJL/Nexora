@@ -37,6 +37,12 @@ from nexora_proto import (
     unpack_packet,
 )
 
+STREAM_SOCK_TIMEOUT = 0.06
+STREAM_RECV_SLICE = 128
+STREAM_RECV_ROUNDS = 8
+STREAM_RECV_MAX_BYTES = 1024
+DOWNSTREAM_CHUNK_SIZE = 112
+
 
 class SessionStore:
     def __init__(self, session_ttl: float = 900.0) -> None:
@@ -160,7 +166,7 @@ def _cache_put(sess: dict, msg_type: int, nonce: int, packet: bytes) -> None:
             cache.pop(k, None)
 
 
-def _enqueue_downstream(sess: dict, raw: bytes, chunk_size: int = 48) -> None:
+def _enqueue_downstream(sess: dict, raw: bytes, chunk_size: int = DOWNSTREAM_CHUNK_SIZE) -> None:
     if not raw:
         return
     q = sess.setdefault("down_q", deque())
@@ -253,7 +259,7 @@ def run_server(
                     tport = int(p)
                     stream_sock = socket.create_connection((host, tport), timeout=1.5)
                     # Keep recv non-blocking enough for DNS round-trip timing.
-                    stream_sock.settimeout(0.2)
+                    stream_sock.settimeout(STREAM_SOCK_TIMEOUT)
                     old = sess.get("stream_sock")
                     if old is not None:
                         try:
@@ -298,18 +304,22 @@ def run_server(
                     if packet.payload:
                         st.sendall(packet.payload)
                     recv_chunks = []
-                    for _ in range(4):
+                    recv_total = 0
+                    for _ in range(STREAM_RECV_ROUNDS):
+                        if recv_total >= STREAM_RECV_MAX_BYTES:
+                            break
                         try:
-                            part = st.recv(96)
+                            part = st.recv(min(STREAM_RECV_SLICE, STREAM_RECV_MAX_BYTES - recv_total))
                             if not part:
                                 break
                             recv_chunks.append(part)
-                            if len(part) < 96:
+                            recv_total += len(part)
+                            if len(part) < STREAM_RECV_SLICE:
                                 break
                         except socket.timeout:
                             break
                     recv_data = b"".join(recv_chunks)
-                    _enqueue_downstream(sess, recv_data)
+                    _enqueue_downstream(sess, recv_data, chunk_size=DOWNSTREAM_CHUNK_SIZE)
                     q = sess.get("down_q", deque())
                     if q:
                         seq, out_chunk = q.popleft()
