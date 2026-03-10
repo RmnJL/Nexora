@@ -27,6 +27,7 @@ Current implementation is an early protocol prototype with:
 
 - session handshake: `HELLO -> HELLO_ACK`
 - basic data exchange: `DATA -> DATA_ACK`
+- minimal TCP stream test path: `STREAM_OPEN -> STREAM_SEND -> STREAM_RECV -> STREAM_CLOSE`
 - minimal DNS wire encode/decode path for TXT payloads
 
 Core files:
@@ -47,6 +48,20 @@ Expected output:
 
 - `handshake ok`
 - `data ack ok`
+
+## TCP Stream Test (Phase 3)
+
+After server is running, client can run a TCP stream test through DNS transport:
+
+```bash
+python3 nexora_client.py \
+  --server 185.49.84.2 \
+  --zone t1.phonexpress.ir \
+  --qtype TXT \
+  --attempts 20 \
+  --tcp-test-host example.com \
+  --tcp-test-port 80
+```
 
 ## Status
 

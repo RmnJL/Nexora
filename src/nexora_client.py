@@ -18,6 +18,11 @@ from nexora_proto import (
     TYPE_DATA_ACK,
     TYPE_HELLO,
     TYPE_HELLO_ACK,
+    TYPE_STREAM_CLOSE,
+    TYPE_STREAM_OPEN,
+    TYPE_STREAM_OPEN_ACK,
+    TYPE_STREAM_RECV,
+    TYPE_STREAM_SEND,
     decode_dns_data,
     encode_dns_data,
     pack_packet,
@@ -92,6 +97,46 @@ def run_client(
     return sid
 
 
+def run_tcp_test(
+    server: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+    target_host: str,
+    target_port: int,
+    request_data: str,
+) -> int:
+    sid = run_client(server, port, zone, timeout, attempts, qtype)
+
+    n1 = random_nonce()
+    open_pkt = pack_packet(
+        TYPE_STREAM_OPEN, sid, n1, f"{target_host}:{target_port}".encode("ascii")
+    )
+    _, op = _query_txt(server, port, zone, timeout, open_pkt, attempts, qtype)
+    if op.msg_type != TYPE_STREAM_OPEN_ACK or op.nonce != n1 or op.payload != b"OK":
+        raise RuntimeError(f"stream open failed: {op.payload!r}")
+    print("[nexora-client] stream open ok")
+
+    n2 = random_nonce()
+    send_pkt = pack_packet(TYPE_STREAM_SEND, sid, n2, request_data.encode("utf-8"))
+    _, rp = _query_txt(server, port, zone, timeout, send_pkt, attempts, qtype)
+    if rp.msg_type != TYPE_STREAM_RECV or rp.nonce != n2:
+        raise RuntimeError("stream recv mismatch")
+    decoded = rp.payload.decode("utf-8", errors="replace")
+    print(f"[nexora-client] stream recv ({len(rp.payload)} bytes):")
+    print(decoded)
+
+    n3 = random_nonce()
+    close_pkt = pack_packet(TYPE_STREAM_CLOSE, sid, n3, b"")
+    _, cp = _query_txt(server, port, zone, timeout, close_pkt, attempts, qtype)
+    if cp.msg_type != TYPE_STREAM_CLOSE or cp.nonce != n3:
+        raise RuntimeError("stream close mismatch")
+    print("[nexora-client] stream close ok")
+    return sid
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Nexora phase-1 client")
     p.add_argument("--server", required=True, help="DNS server IP")
@@ -100,9 +145,28 @@ def main() -> None:
     p.add_argument("--timeout", type=float, default=2.0)
     p.add_argument("--attempts", type=int, default=4)
     p.add_argument("--qtype", choices=["TXT", "A"], default="A")
+    p.add_argument("--tcp-test-host", default="")
+    p.add_argument("--tcp-test-port", type=int, default=80)
+    p.add_argument(
+        "--tcp-test-request",
+        default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
-    run_client(args.server, args.port, args.zone, args.timeout, args.attempts, qtype)
+    if args.tcp_test_host:
+        run_tcp_test(
+            args.server,
+            args.port,
+            args.zone,
+            args.timeout,
+            args.attempts,
+            qtype,
+            args.tcp_test_host,
+            args.tcp_test_port,
+            args.tcp_test_request,
+        )
+    else:
+        run_client(args.server, args.port, args.zone, args.timeout, args.attempts, qtype)
 
 
 if __name__ == "__main__":

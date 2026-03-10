@@ -16,3 +16,8 @@ Signature: Rmn JL
 - One TCP stream can pass end-to-end.
 - Basic retransmission works under packet loss.
 
+## Current Progress
+
+- Phase 1 done: HELLO/HELLO_ACK.
+- Phase 2 done: DATA/DATA_ACK.
+- Phase 3 MVP done: STREAM_OPEN, STREAM_SEND, STREAM_RECV, STREAM_CLOSE.

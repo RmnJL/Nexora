@@ -25,6 +25,11 @@ from nexora_proto import (
     TYPE_DATA_ACK,
     TYPE_HELLO,
     TYPE_HELLO_ACK,
+    TYPE_STREAM_CLOSE,
+    TYPE_STREAM_OPEN,
+    TYPE_STREAM_OPEN_ACK,
+    TYPE_STREAM_RECV,
+    TYPE_STREAM_SEND,
     decode_dns_data,
     encode_dns_data,
     pack_packet,
@@ -42,12 +47,16 @@ class SessionStore:
         with self._lock:
             sid = self._next
             self._next += 1
-            self._items[sid] = {"addr": addr, "ts": time.time()}
+            self._items[sid] = {"addr": addr, "ts": time.time(), "stream_sock": None}
             return sid
 
     def exists(self, sid: int) -> bool:
         with self._lock:
             return sid in self._items
+
+    def get(self, sid: int) -> dict | None:
+        with self._lock:
+            return self._items.get(sid)
 
 
 def _extract_encoded_chunk(qname: str, zone: str) -> str:
@@ -61,6 +70,13 @@ def _extract_encoded_chunk(qname: str, zone: str) -> str:
 
 def _as_labels(s: str, size: int = 50) -> str:
     return ".".join(s[i : i + size] for i in range(0, len(s), size))
+
+
+def _make_dns_answer(request: bytes, qtype: int, packet: bytes) -> bytes:
+    txt = encode_dns_data(packet)
+    if qtype == TYPE_TXT:
+        return build_txt_answer(request, txt, ttl=0)
+    return build_cname_answer(request, _as_labels(txt) + ".x.")
 
 
 def run_server(bind: str, port: int, zone: str) -> None:
@@ -85,11 +101,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
             if packet.msg_type == TYPE_HELLO:
                 sid = sessions.new(addr)
                 ack = pack_packet(TYPE_HELLO_ACK, sid, packet.nonce, b"OK")
-                txt = encode_dns_data(ack)
-                if qtype == TYPE_TXT:
-                    answer = build_txt_answer(data, txt, ttl=0)
-                else:
-                    answer = build_cname_answer(data, _as_labels(txt) + ".x.")
+                answer = _make_dns_answer(data, qtype, ack)
                 sock.sendto(answer, addr)
                 print(
                     f"[nexora-server] hello from {addr[0]}:{addr[1]} -> session={sid}"
@@ -102,12 +114,83 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 ack = pack_packet(
                     TYPE_DATA_ACK, packet.session_id, packet.nonce, ack_data
                 )
-                txt = encode_dns_data(ack)
-                if qtype == TYPE_TXT:
-                    answer = build_txt_answer(data, txt, ttl=0)
-                else:
-                    answer = build_cname_answer(data, _as_labels(txt) + ".x.")
-                sock.sendto(answer, addr)
+                sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+                continue
+
+            if packet.msg_type == TYPE_STREAM_OPEN and sessions.exists(packet.session_id):
+                sess = sessions.get(packet.session_id)
+                if sess is None:
+                    sock.sendto(build_servfail(data), addr)
+                    continue
+
+                # payload format: b"host:port"
+                try:
+                    target = packet.payload.decode("ascii", errors="ignore")
+                    host, p = target.rsplit(":", 1)
+                    tport = int(p)
+                    stream_sock = socket.create_connection((host, tport), timeout=1.5)
+                    stream_sock.settimeout(2)
+                    old = sess.get("stream_sock")
+                    if old is not None:
+                        try:
+                            old.close()
+                        except Exception:
+                            pass
+                    sess["stream_sock"] = stream_sock
+                    ack = pack_packet(
+                        TYPE_STREAM_OPEN_ACK, packet.session_id, packet.nonce, b"OK"
+                    )
+                    print(
+                        f"[nexora-server] stream open session={packet.session_id} target={host}:{tport}"
+                    )
+                except Exception:
+                    ack = pack_packet(
+                        TYPE_STREAM_OPEN_ACK,
+                        packet.session_id,
+                        packet.nonce,
+                        b"ER",
+                    )
+                    print(
+                        f"[nexora-server] stream open failed session={packet.session_id}"
+                    )
+                sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+                continue
+
+            if packet.msg_type == TYPE_STREAM_SEND and sessions.exists(packet.session_id):
+                sess = sessions.get(packet.session_id)
+                if sess is None or sess.get("stream_sock") is None:
+                    sock.sendto(build_servfail(data), addr)
+                    continue
+                st = sess["stream_sock"]
+                try:
+                    st.sendall(packet.payload)
+                    try:
+                        recv_data = st.recv(96)
+                    except socket.timeout:
+                        recv_data = b""
+                    print(
+                        f"[nexora-server] stream send session={packet.session_id} recv={len(recv_data)}"
+                    )
+                    ack = pack_packet(
+                        TYPE_STREAM_RECV, packet.session_id, packet.nonce, recv_data
+                    )
+                except Exception:
+                    ack = pack_packet(
+                        TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
+                    )
+                sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+                continue
+
+            if packet.msg_type == TYPE_STREAM_CLOSE and sessions.exists(packet.session_id):
+                sess = sessions.get(packet.session_id)
+                if sess is not None and sess.get("stream_sock") is not None:
+                    try:
+                        sess["stream_sock"].close()
+                    except Exception:
+                        pass
+                    sess["stream_sock"] = None
+                ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"K")
+                sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
 
             sock.sendto(build_servfail(data), addr)
