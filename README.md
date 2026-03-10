@@ -51,3 +51,9 @@ Expected output:
 ## Status
 
 This is a research-stage codebase, not a production system.
+
+## Repository Control
+
+Hardening and owner-only control settings are documented in:
+
+- `docs/REPOSITORY_HARDENING.md`
