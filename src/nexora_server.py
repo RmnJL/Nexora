@@ -89,7 +89,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 if qtype == TYPE_TXT:
                     answer = build_txt_answer(data, txt, ttl=0)
                 else:
-                    answer = build_cname_answer(data, _as_labels(txt) + ".nexora.")
+                    answer = build_cname_answer(data, _as_labels(txt) + ".x.")
                 sock.sendto(answer, addr)
                 print(
                     f"[nexora-server] hello from {addr[0]}:{addr[1]} -> session={sid}"
@@ -97,8 +97,8 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 continue
 
             if packet.msg_type == TYPE_DATA and sessions.exists(packet.session_id):
-                # Phase-2 behavior: echo payload back in DATA_ACK.
-                ack_data = b"ACK:" + packet.payload
+                # Keep ACK payload tiny to survive strict DNS relays.
+                ack_data = b"K"
                 ack = pack_packet(
                     TYPE_DATA_ACK, packet.session_id, packet.nonce, ack_data
                 )
@@ -106,7 +106,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 if qtype == TYPE_TXT:
                     answer = build_txt_answer(data, txt, ttl=0)
                 else:
-                    answer = build_cname_answer(data, _as_labels(txt) + ".nexora.")
+                    answer = build_cname_answer(data, _as_labels(txt) + ".x.")
                 sock.sendto(answer, addr)
                 continue
 

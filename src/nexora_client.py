@@ -53,6 +53,8 @@ def _query_txt(
             txt = parse_answer_data(resp, qid)
             if txt.endswith(".nexora"):
                 txt = txt[: -len(".nexora")].strip(".")
+            elif txt.endswith(".x"):
+                txt = txt[: -len(".x")].strip(".")
             return qid, unpack_packet(decode_dns_data(txt))
         except Exception as e:
             last_err = e
