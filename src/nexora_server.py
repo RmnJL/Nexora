@@ -45,7 +45,11 @@ STREAM_SOCK_TIMEOUT = 0.5
 STREAM_RECV_SLICE = 512
 STREAM_RECV_ROUNDS = 8
 STREAM_RECV_MAX_BYTES = 4096
-DOWNSTREAM_CHUNK_SIZE = 140
+# Downstream chunk MUST stay small enough so the base32-encoded response
+# fits in a DNS CNAME name (max 255 wire bytes).  With label size 50 and
+# ".x." suffix the safe ceiling is ~220 base32 chars → 137 raw bytes.
+# 137 - 15 header = 122 payload.  We use 120 payload / 100-byte chunks.
+DOWNSTREAM_CHUNK_SIZE = 100
 
 # Rate limiting: max HELLO requests per source IP within window.
 # NOTE: in DNS tunneling, source IP = resolver, not real client.
@@ -206,8 +210,12 @@ def _as_labels(s: str, size: int = 50) -> str:
 def _make_dns_answer(request: bytes, qtype: int, packet: bytes) -> bytes:
     txt = encode_dns_data(packet)
     if qtype == TYPE_TXT:
+        if len(txt) > 255:
+            log.warning("TXT payload too large (%d chars), truncating", len(txt))
+            txt = txt[:255]
         return build_txt_answer(request, txt, ttl=0)
-    return build_cname_answer(request, _as_labels(txt) + ".x.")
+    cname = _as_labels(txt) + ".x."
+    return build_cname_answer(request, cname)
 
 
 def _cache_get(sess: dict, msg_type: int, nonce: int) -> bytes | None:
@@ -387,10 +395,9 @@ def run_server(
                     _enqueue_downstream(sess, recv_data, chunk_size=DOWNSTREAM_CHUNK_SIZE)
                     q = sess.get("down_q", deque())
                     # Pack as many queued chunks as fit in one DNS response.
-                    # Each entry: [1B entry_len][2B seq][data]
-                    # TXT single string: max ~255 base32 chars → ~159 raw bytes.
-                    # Minus 15-byte Nexora header → ~144 bytes for payload.
-                    max_payload = 144
+                    # For CNAME safety: max ~220 base32 chars → 137 raw → 122 payload.
+                    # Use 120 as safe ceiling.
+                    max_payload = 120
                     out_payload = b""
                     while q:
                         seq, out_chunk = q[0]
@@ -400,14 +407,15 @@ def run_server(
                             break
                         q.popleft()
                         out_payload += entry
-                    log.debug(
-                        "stream send session=%d recv=%d out=%d", packet.session_id, len(recv_data), len(out_payload)
+                    log.info(
+                        "stream data sid=%d up=%d down=%d q=%d",
+                        packet.session_id, len(packet.payload), len(recv_data), len(q),
                     )
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload
                     )
                 except Exception:
-                    log.debug("stream send error session=%d", packet.session_id, exc_info=True)
+                    log.warning("stream send error session=%d", packet.session_id, exc_info=True)
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
                     )

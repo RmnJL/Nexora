@@ -513,14 +513,13 @@ def run_forward_server(
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsock.bind((listen_host, listen_port))
-    lsock.listen(32)
+    lsock.listen(256)
     log.info(
         "forward server listening on %s:%d -> %s:%d via resolvers=%s:%d",
         listen_host, listen_port, target_host, target_port,
         ','.join(selector.servers), port,
     )
     sem = threading.BoundedSemaphore(max(1, max_conns))
-    max_per_ip = max(1, min(max(1, max_conns), max_conns_per_ip))
     ip_counts: dict[str, int] = {}
     ip_lock = Lock()
     while True:
@@ -535,25 +534,9 @@ def run_forward_server(
                 pass
             continue
 
+        # Track per-IP count for observability (no longer rejects).
         with ip_lock:
-            ip_n = ip_counts.get(peer_ip, 0)
-            if ip_n >= max_per_ip:
-                ip_ok = False
-            else:
-                ip_counts[peer_ip] = ip_n + 1
-                ip_ok = True
-
-        if not ip_ok:
-            sem.release()
-            log.warning(
-                "forward reject local=%s:%d reason=max_conns_per_ip limit=%d",
-                peer_ip, addr[1], max_per_ip,
-            )
-            try:
-                conn.close()
-            except Exception:
-                pass
-            continue
+            ip_counts[peer_ip] = ip_counts.get(peer_ip, 0) + 1
 
         def _worker(
             local_conn: socket.socket = conn,
