@@ -365,6 +365,7 @@ def run_server(
             if packet.msg_type == TYPE_STREAM_SEND and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
                 if sess is None or sess.get("stream_sock") is None:
+                    log.warning("stream_send: session %d has no stream_sock, SERVFAIL", packet.session_id)
                     sock.sendto(build_servfail(data), addr)
                     continue
                 sessions.touch(packet.session_id)
@@ -441,7 +442,7 @@ def run_server(
 
             sock.sendto(build_servfail(data), addr)
         except Exception:
-            log.debug("packet parse/handle error from %s", addr, exc_info=True)
+            log.warning("packet parse/handle error from %s", addr, exc_info=True)
             try:
                 sock.sendto(build_servfail(data), addr)
             except Exception:

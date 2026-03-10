@@ -208,7 +208,7 @@ def _query_txt(
         except Exception as e:
             last_err = e
             selector.report_failure(server)
-            log.debug("query attempt %d failed server=%s: %s", idx + 1, server, e)
+            log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
             # Small jitter-like backoff to avoid resolver burst drop.
             time.sleep(0.15 * (idx + 1))
     raise TimeoutError(
@@ -432,6 +432,10 @@ def _handle_forward_conn(
             nonce = random_nonce()
             pkt = pack_packet(TYPE_STREAM_SEND, sid, nonce, outbound)
             _, resp = _query_txt(selector, port, zone, timeout, pkt, attempts, qtype)
+            log.info(
+                "stream xfer sid=%d up=%d resp_type=%d resp_pay=%d",
+                sid, len(outbound), resp.msg_type, len(resp.payload),
+            )
             if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != nonce:
                 raise RuntimeError("stream recv mismatch")
 
@@ -478,10 +482,14 @@ def _handle_forward_conn(
             if local_closed and idle_rounds >= 3:
                 break
 
-    except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
+    except TimeoutError as e:
+        log.warning("forward timeout %s sid=%s: %s", client_addr, sid, e)
+    except (BrokenPipeError, ConnectionResetError) as e:
+        log.info("forward pipe closed %s sid=%s: %s", client_addr, sid, e)
+    except OSError as e:
+        log.warning("forward os-error %s sid=%s: %s", client_addr, sid, e)
     except Exception as e:
-        log.warning("forward error %s: %s", client_addr, e)
+        log.warning("forward error %s sid=%s: %s", client_addr, sid, e)
     finally:
         if sid is not None:
             _stream_close(sid, selector, port, zone, timeout, attempts, qtype)
