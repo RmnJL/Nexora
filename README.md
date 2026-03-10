@@ -86,6 +86,24 @@ python3 nexora_client.py \
 
 This is the basic building block for routing user traffic to an outside service (for example, X-UI inbound) through Nexora.
 
+## Persistent Operation (systemd)
+
+For always-on operation with automatic restart after crash/reboot, use the included systemd units:
+
+- `deploy/systemd/nexora-server.service`
+- `deploy/systemd/nexora-client-forward.service`
+
+They support override values from:
+
+- `/etc/default/nexora-server`
+- `/etc/default/nexora-client-forward`
+
+Recommended mode for long-running tests:
+
+- run with `python3 -u` (already set in service files)
+- keep server-side session cleanup enabled (`--session-ttl`, `--cleanup-interval`)
+- use multiple resolvers in client `--server` with health loop options
+
 ## Status
 
 This is a research-stage codebase, not a production system.

@@ -39,9 +39,10 @@ from nexora_proto import (
 
 
 class SessionStore:
-    def __init__(self) -> None:
+    def __init__(self, session_ttl: float = 900.0) -> None:
         self._lock = threading.Lock()
         self._next = 1
+        self._session_ttl = max(30.0, session_ttl)
         self._items: dict[int, dict] = {}
 
     def new(self, addr: tuple[str, int]) -> int:
@@ -59,12 +60,71 @@ class SessionStore:
             return sid
 
     def exists(self, sid: int) -> bool:
+        stale_sock = None
+        exists_ok = False
         with self._lock:
-            return sid in self._items
+            item = self._items.get(sid)
+            if item is None:
+                exists_ok = False
+            elif time.time() - float(item.get("ts", 0.0)) > self._session_ttl:
+                stale_sock = item.get("stream_sock")
+                self._items.pop(sid, None)
+                exists_ok = False
+            else:
+                exists_ok = True
+        if stale_sock is not None:
+            try:
+                stale_sock.close()
+            except Exception:
+                pass
+        return exists_ok
 
     def get(self, sid: int) -> dict | None:
+        stale_sock = None
+        out: dict | None = None
         with self._lock:
-            return self._items.get(sid)
+            item = self._items.get(sid)
+            if item is None:
+                out = None
+            elif time.time() - float(item.get("ts", 0.0)) > self._session_ttl:
+                stale_sock = item.get("stream_sock")
+                self._items.pop(sid, None)
+                out = None
+            else:
+                item["ts"] = time.time()
+                out = item
+        if stale_sock is not None:
+            try:
+                stale_sock.close()
+            except Exception:
+                pass
+        return out
+
+    def touch(self, sid: int) -> None:
+        with self._lock:
+            item = self._items.get(sid)
+            if item is not None:
+                item["ts"] = time.time()
+
+    def cleanup_expired(self) -> int:
+        now = time.time()
+        stale_socks = []
+        with self._lock:
+            stale_ids = [
+                sid
+                for sid, item in self._items.items()
+                if now - float(item.get("ts", 0.0)) > self._session_ttl
+            ]
+            for sid in stale_ids:
+                item = self._items.pop(sid, None)
+                if item is not None and item.get("stream_sock") is not None:
+                    stale_socks.append(item["stream_sock"])
+        for st in stale_socks:
+            try:
+                st.close()
+            except Exception:
+                pass
+        return len(stale_socks) if stale_socks else len(stale_ids)
 
 
 def _extract_encoded_chunk(qname: str, zone: str) -> str:
@@ -112,14 +172,29 @@ def _enqueue_downstream(sess: dict, raw: bytes, chunk_size: int = 48) -> None:
     sess["down_seq"] = seq
 
 
-def run_server(bind: str, port: int, zone: str) -> None:
-    sessions = SessionStore()
+def run_server(
+    bind: str,
+    port: int,
+    zone: str,
+    session_ttl: float = 900.0,
+    cleanup_interval: float = 60.0,
+) -> None:
+    sessions = SessionStore(session_ttl=session_ttl)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((bind, port))
-    print(f"[nexora-server] listening on {bind}:{port} zone={zone}")
+    print(
+        f"[nexora-server] listening on {bind}:{port} zone={zone} session_ttl={session_ttl}s"
+    )
+    last_cleanup = time.time()
 
     while True:
         data, addr = sock.recvfrom(4096)
+        now = time.time()
+        if now - last_cleanup >= max(5.0, cleanup_interval):
+            removed = sessions.cleanup_expired()
+            if removed:
+                print(f"[nexora-server] cleanup expired sessions={removed}")
+            last_cleanup = now
         try:
             qid, qname, qtype = parse_query(data)
             if qtype not in (TYPE_TXT, TYPE_A):
@@ -146,6 +221,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 if sess is None:
                     sock.sendto(build_servfail(data), addr)
                     continue
+                sessions.touch(packet.session_id)
                 cached = _cache_get(sess, TYPE_DATA, packet.nonce)
                 if cached is not None:
                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
@@ -164,6 +240,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 if sess is None:
                     sock.sendto(build_servfail(data), addr)
                     continue
+                sessions.touch(packet.session_id)
                 cached = _cache_get(sess, TYPE_STREAM_OPEN, packet.nonce)
                 if cached is not None:
                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
@@ -211,6 +288,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                 if sess is None or sess.get("stream_sock") is None:
                     sock.sendto(build_servfail(data), addr)
                     continue
+                sessions.touch(packet.session_id)
                 cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
                 if cached is not None:
                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
@@ -263,6 +341,7 @@ def run_server(bind: str, port: int, zone: str) -> None:
                     sess["down_q"] = deque()
                 ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"K")
                 if sess is not None:
+                    sessions.touch(packet.session_id)
                     _cache_put(sess, TYPE_STREAM_CLOSE, packet.nonce, ack)
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
@@ -280,8 +359,26 @@ def main() -> None:
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
+    p.add_argument(
+        "--session-ttl",
+        type=float,
+        default=900.0,
+        help="expire inactive sessions after this many seconds",
+    )
+    p.add_argument(
+        "--cleanup-interval",
+        type=float,
+        default=60.0,
+        help="run session cleanup every N seconds",
+    )
     args = p.parse_args()
-    run_server(args.bind, args.port, args.zone)
+    run_server(
+        args.bind,
+        args.port,
+        args.zone,
+        session_ttl=args.session_ttl,
+        cleanup_interval=args.cleanup_interval,
+    )
 
 
 if __name__ == "__main__":
