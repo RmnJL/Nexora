@@ -210,7 +210,7 @@ def _query_txt(
             selector.report_failure(server)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
             # Small jitter-like backoff to avoid resolver burst drop.
-            time.sleep(0.15 * (idx + 1))
+            time.sleep(0.08 * (idx + 1))
     raise TimeoutError(
         f"dns query failed after {attempts} attempts (last resolver {last_server}): {last_err}"
     )
@@ -675,7 +675,7 @@ def main() -> None:
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
     p.add_argument("--timeout", type=float, default=2.0)
-    p.add_argument("--attempts", type=int, default=4)
+    p.add_argument("--attempts", type=int, default=3)
     p.add_argument("--qtype", choices=["TXT", "A"], default="A")
     p.add_argument("--tcp-test-host", default="")
     p.add_argument("--tcp-test-port", type=int, default=80)
@@ -683,14 +683,14 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
-    p.add_argument("--tcp-chunk-size", type=int, default=24)
+    p.add_argument("--tcp-chunk-size", type=int, default=110)
     p.add_argument("--forward-listen-host", default="")
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
     p.add_argument("--forward-target-port", type=int, default=0)
-    p.add_argument("--forward-max-conns", type=int, default=24)
+    p.add_argument("--forward-max-conns", type=int, default=8)
     p.add_argument("--forward-max-conns-per-ip", type=int, default=64)
-    p.add_argument("--stream-open-retries", type=int, default=3)
+    p.add_argument("--stream-open-retries", type=int, default=2)
     p.add_argument(
         "--forward-poll-min-interval",
         type=float,

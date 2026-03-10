@@ -44,22 +44,22 @@ Client options:
   --zone DOMAIN              default: t1.phonexpress.ir
   --qtype TXT|A              default: TXT
   --timeout SECONDS          default: 3
-  --attempts N               default: 10
+  --attempts N               default: 3
   --resolver-fail-cooldown   default: 20
   --resolver-health-interval default: 120
   --resolver-switch-interval default: 300
   --resolver-probe-timeout   default: 1.6
   --resolver-probe-qtype     default: TXT
-  --tcp-chunk-size N         default: 24
+  --tcp-chunk-size N         default: 110
   --listen-host IP           default: 0.0.0.0
   --listen-port PORT         default: 1443
   --target-host IP           default: 127.0.0.1
   --target-port PORT         default: 8443
-  --max-conns N              default: 128
+  --max-conns N              default: 8
   --max-conns-per-ip N       default: 64
-  --stream-open-retries N    default: 5
-  --poll-min-interval SEC    default: 0.12
-  --poll-max-interval SEC    default: 1.2
+  --stream-open-retries N    default: 2
+  --poll-min-interval SEC    default: 0.1
+  --poll-max-interval SEC    default: 1.0
   --idle-timeout SEC         default: 25
 EOF
 }
@@ -124,22 +124,22 @@ install_client() {
   local zone="t1.phonexpress.ir"
   local qtype="TXT"
   local timeout="3"
-  local attempts="10"
+  local attempts="3"
   local resolver_fail_cooldown="20"
   local resolver_health_interval="120"
   local resolver_switch_interval="300"
   local resolver_probe_timeout="1.6"
   local resolver_probe_qtype="TXT"
-  local tcp_chunk_size="24"
+  local tcp_chunk_size="110"
   local listen_host="0.0.0.0"
   local listen_port="1443"
   local target_host="127.0.0.1"
   local target_port="8443"
-  local max_conns="512"
-  local max_conns_per_ip="512"
-  local stream_open_retries="5"
-  local poll_min_interval="0.05"
-  local poll_max_interval="0.8"
+  local max_conns="8"
+  local max_conns_per_ip="64"
+  local stream_open_retries="2"
+  local poll_min_interval="0.1"
+  local poll_max_interval="1.0"
   local idle_timeout="25"
   local client_py="/root/nexora/src/nexora_client.py"
 
