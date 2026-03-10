@@ -1,0 +1,136 @@
+"""
+Minimal DNS wire helpers for Nexora phase 1.
+Signature: Rmn JL
+"""
+
+from __future__ import annotations
+
+import random
+import struct
+from typing import Tuple
+
+TYPE_TXT = 16
+CLASS_IN = 1
+
+
+def _encode_name(name: str) -> bytes:
+    labels = [x for x in name.strip(".").split(".") if x]
+    out = bytearray()
+    for label in labels:
+        b = label.encode("ascii")
+        if len(b) > 63:
+            raise ValueError("label too long")
+        out.append(len(b))
+        out.extend(b)
+    out.append(0)
+    return bytes(out)
+
+
+def _decode_name(packet: bytes, offset: int) -> Tuple[str, int]:
+    labels = []
+    jumped = False
+    next_offset = offset
+    steps = 0
+    while True:
+        if offset >= len(packet):
+            raise ValueError("truncated name")
+        ln = packet[offset]
+        if ln == 0:
+            offset += 1
+            if not jumped:
+                next_offset = offset
+            break
+        # compression pointer
+        if (ln & 0xC0) == 0xC0:
+            if offset + 1 >= len(packet):
+                raise ValueError("truncated pointer")
+            ptr = ((ln & 0x3F) << 8) | packet[offset + 1]
+            if ptr >= len(packet):
+                raise ValueError("bad pointer")
+            if not jumped:
+                next_offset = offset + 2
+            offset = ptr
+            jumped = True
+            steps += 1
+            if steps > 20:
+                raise ValueError("pointer loop")
+            continue
+        offset += 1
+        if offset + ln > len(packet):
+            raise ValueError("truncated label")
+        labels.append(packet[offset : offset + ln].decode("ascii", errors="ignore"))
+        offset += ln
+        if not jumped:
+            next_offset = offset
+    return ".".join(labels), next_offset
+
+
+def build_txt_query(name: str) -> tuple[int, bytes]:
+    qid = random.getrandbits(16)
+    header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q = _encode_name(name) + struct.pack(">HH", TYPE_TXT, CLASS_IN)
+    return qid, header + q
+
+
+def parse_query(packet: bytes) -> tuple[int, str, int]:
+    if len(packet) < 12:
+        raise ValueError("short dns packet")
+    qid, _flags, qd, _an, _ns, _ar = struct.unpack(">HHHHHH", packet[:12])
+    if qd != 1:
+        raise ValueError("only one question supported")
+    name, off = _decode_name(packet, 12)
+    if off + 4 > len(packet):
+        raise ValueError("missing qtype/qclass")
+    qtype, _qclass = struct.unpack(">HH", packet[off : off + 4])
+    return qid, name, qtype
+
+
+def parse_txt_answer(packet: bytes, expected_qid: int) -> str:
+    if len(packet) < 12:
+        raise ValueError("short dns answer")
+    qid, _flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", packet[:12])
+    if qid != expected_qid:
+        raise ValueError("mismatched id")
+    if qd != 1 or an < 1:
+        raise ValueError("no answer")
+
+    _qname, off = _decode_name(packet, 12)
+    off += 4
+    # first answer only
+    _aname, off = _decode_name(packet, off)
+    if off + 10 > len(packet):
+        raise ValueError("short rr header")
+    atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", packet[off : off + 10])
+    off += 10
+    if atype != TYPE_TXT or off + rdlen > len(packet):
+        raise ValueError("bad txt answer")
+    rdata = packet[off : off + rdlen]
+    if not rdata:
+        return ""
+    txt_len = rdata[0]
+    if txt_len + 1 > len(rdata):
+        raise ValueError("bad txt len")
+    return rdata[1 : 1 + txt_len].decode("ascii", errors="ignore")
+
+
+def build_servfail(request: bytes) -> bytes:
+    qid = request[:2]
+    flags = struct.pack(">H", 0x8002)
+    counts = struct.pack(">HHHH", 1, 0, 0, 0)
+    # copy question section
+    _, off = _decode_name(request, 12)
+    end = off + 4
+    return qid + flags + counts + request[12:end]
+
+
+def build_txt_answer(request: bytes, txt_data: str, ttl: int = 0) -> bytes:
+    qid = request[:2]
+    flags = struct.pack(">H", 0x8180)
+    counts = struct.pack(">HHHH", 1, 1, 0, 0)
+    qname, off = _decode_name(request, 12)
+    qsec = request[12 : off + 4]
+    name_ptr = struct.pack(">H", 0xC00C)
+    rr_hdr = struct.pack(">HHIH", TYPE_TXT, CLASS_IN, ttl, len(txt_data) + 1)
+    rdata = bytes([len(txt_data)]) + txt_data.encode("ascii")
+    return qid + flags + counts + qsec + name_ptr + rr_hdr + rdata
+
