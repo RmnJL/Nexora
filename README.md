@@ -59,6 +59,7 @@ python3 nexora_client.py \
   --zone t1.phonexpress.ir \
   --qtype TXT \
   --attempts 20 \
+  --tcp-chunk-size 24 \
   --tcp-test-host example.com \
   --tcp-test-port 80
 ```

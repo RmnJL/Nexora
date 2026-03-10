@@ -107,6 +107,7 @@ def run_tcp_test(
     target_host: str,
     target_port: int,
     request_data: str,
+    chunk_size: int,
 ) -> int:
     sid = run_client(server, port, zone, timeout, attempts, qtype)
 
@@ -119,13 +120,41 @@ def run_tcp_test(
         raise RuntimeError(f"stream open failed: {op.payload!r}")
     print("[nexora-client] stream open ok")
 
-    n2 = random_nonce()
-    send_pkt = pack_packet(TYPE_STREAM_SEND, sid, n2, request_data.encode("utf-8"))
-    _, rp = _query_txt(server, port, zone, timeout, send_pkt, attempts, qtype)
-    if rp.msg_type != TYPE_STREAM_RECV or rp.nonce != n2:
-        raise RuntimeError("stream recv mismatch")
-    decoded = rp.payload.decode("utf-8", errors="replace")
-    print(f"[nexora-client] stream recv ({len(rp.payload)} bytes):")
+    req_bytes = request_data.encode("utf-8")
+    if chunk_size < 1:
+        chunk_size = len(req_bytes)
+
+    recv_parts: list[bytes] = []
+    for idx in range(0, len(req_bytes), chunk_size):
+        chunk = req_bytes[idx : idx + chunk_size]
+        n2 = random_nonce()
+        send_pkt = pack_packet(TYPE_STREAM_SEND, sid, n2, chunk)
+        _, rp = _query_txt(server, port, zone, timeout, send_pkt, attempts, qtype)
+        if rp.msg_type != TYPE_STREAM_RECV or rp.nonce != n2:
+            raise RuntimeError("stream recv mismatch")
+        if rp.payload:
+            recv_parts.append(rp.payload)
+
+    # Pull extra downstream data with empty sends.
+    empty_rounds = 0
+    for _ in range(20):
+        n4 = random_nonce()
+        pull_pkt = pack_packet(TYPE_STREAM_SEND, sid, n4, b"")
+        _, pr = _query_txt(server, port, zone, timeout, pull_pkt, attempts, qtype)
+        if pr.msg_type != TYPE_STREAM_RECV or pr.nonce != n4:
+            raise RuntimeError("stream pull mismatch")
+        if pr.payload:
+            recv_parts.append(pr.payload)
+            empty_rounds = 0
+        else:
+            empty_rounds += 1
+            if empty_rounds >= 2:
+                break
+        time.sleep(0.08)
+
+    recv_data = b"".join(recv_parts)
+    decoded = recv_data.decode("utf-8", errors="replace")
+    print(f"[nexora-client] stream recv ({len(recv_data)} bytes):")
     print(decoded)
 
     n3 = random_nonce()
@@ -151,6 +180,7 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
+    p.add_argument("--tcp-chunk-size", type=int, default=24)
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     if args.tcp_test_host:
@@ -164,6 +194,7 @@ def main() -> None:
             args.tcp_test_host,
             args.tcp_test_port,
             args.tcp_test_request,
+            args.tcp_chunk_size,
         )
     else:
         run_client(args.server, args.port, args.zone, args.timeout, args.attempts, qtype)

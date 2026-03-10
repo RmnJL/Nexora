@@ -129,7 +129,8 @@ def run_server(bind: str, port: int, zone: str) -> None:
                     host, p = target.rsplit(":", 1)
                     tport = int(p)
                     stream_sock = socket.create_connection((host, tport), timeout=1.5)
-                    stream_sock.settimeout(2)
+                    # Keep recv non-blocking enough for DNS round-trip timing.
+                    stream_sock.settimeout(0.2)
                     old = sess.get("stream_sock")
                     if old is not None:
                         try:
@@ -163,11 +164,20 @@ def run_server(bind: str, port: int, zone: str) -> None:
                     continue
                 st = sess["stream_sock"]
                 try:
-                    st.sendall(packet.payload)
-                    try:
-                        recv_data = st.recv(96)
-                    except socket.timeout:
-                        recv_data = b""
+                    if packet.payload:
+                        st.sendall(packet.payload)
+                    recv_chunks = []
+                    for _ in range(4):
+                        try:
+                            part = st.recv(96)
+                            if not part:
+                                break
+                            recv_chunks.append(part)
+                            if len(part) < 96:
+                                break
+                        except socket.timeout:
+                            break
+                    recv_data = b"".join(recv_chunks)
                     print(
                         f"[nexora-server] stream send session={packet.session_id} recv={len(recv_data)}"
                     )
