@@ -64,6 +64,28 @@ python3 nexora_client.py \
   --tcp-test-port 80
 ```
 
+## Reverse Forward MVP (Phase 4)
+
+Nexora client can expose a local TCP port on the inside server and forward it to a target on the outside server through DNS transport.
+
+Example:
+
+```bash
+python3 nexora_client.py \
+  --server 185.49.84.2 \
+  --zone t1.phonexpress.ir \
+  --qtype TXT \
+  --timeout 4 \
+  --attempts 20 \
+  --tcp-chunk-size 24 \
+  --forward-listen-host 0.0.0.0 \
+  --forward-listen-port 1443 \
+  --forward-target-host 127.0.0.1 \
+  --forward-target-port 443
+```
+
+This is the basic building block for routing user traffic to an outside service (for example, X-UI inbound) through Nexora.
+
 ## Status
 
 This is a research-stage codebase, not a production system.

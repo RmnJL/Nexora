@@ -22,3 +22,4 @@ Signature: Rmn JL
 - Phase 2 done: DATA/DATA_ACK.
 - Phase 3 MVP done: STREAM_OPEN, STREAM_SEND, STREAM_RECV, STREAM_CLOSE.
 - Phase 3.2 done: downstream queue with sequence chunks and duplicate-safe replay cache.
+- Phase 4 MVP done: reverse local TCP forward mode (inside listen -> outside target over DNS tunnel).

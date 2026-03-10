@@ -10,6 +10,11 @@
 - `nexora-client`: local proxy endpoint (SOCKS5) + DNS transport
 - `nexora-proto`: wire protocol and framing rules
 
+## Product Direction (Recorded Requirement)
+
+- Target use-case: run an X-UI/VLESS service on the outside server and let users reach it through the Nexora DNS tunnel path instead of direct outside-IP exposure.
+- Owner signature requirement: Rmn JL
+
 ## Data Path
 
 1. App connects to local SOCKS5 on client.
@@ -29,4 +34,3 @@
 - Key exchange: X25519
 - Payload AEAD: XChaCha20-Poly1305
 - Replay protection: per-session nonce window
-

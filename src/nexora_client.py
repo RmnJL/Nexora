@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import threading
 import time
 from collections import OrderedDict
 
@@ -96,6 +97,186 @@ def run_client(
         raise RuntimeError("data-ack mismatch")
     print(f"[nexora-client] data ack ok, payload={dpkt.payload!r}")
     return sid
+
+
+def _establish_session(
+    server: str, port: int, zone: str, timeout: float, attempts: int, qtype: int
+) -> int:
+    nonce = random_nonce()
+    hello = pack_packet(TYPE_HELLO, 0, nonce, b"NEXORA_HELLO")
+    _, pkt = _query_txt(server, port, zone, timeout, hello, attempts, qtype)
+    if pkt.msg_type != TYPE_HELLO_ACK or pkt.nonce != nonce:
+        raise RuntimeError("session handshake failed")
+    return pkt.session_id
+
+
+def _stream_open(
+    sid: int,
+    server: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+    target_host: str,
+    target_port: int,
+) -> None:
+    n = random_nonce()
+    op = pack_packet(TYPE_STREAM_OPEN, sid, n, f"{target_host}:{target_port}".encode("ascii"))
+    _, rp = _query_txt(server, port, zone, timeout, op, attempts, qtype)
+    if rp.msg_type != TYPE_STREAM_OPEN_ACK or rp.nonce != n or rp.payload != b"OK":
+        raise RuntimeError("stream open failed")
+
+
+def _stream_close(
+    sid: int,
+    server: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+) -> None:
+    n = random_nonce()
+    cp = pack_packet(TYPE_STREAM_CLOSE, sid, n, b"")
+    try:
+        _, rp = _query_txt(server, port, zone, timeout, cp, attempts, qtype)
+        if rp.msg_type != TYPE_STREAM_CLOSE or rp.nonce != n:
+            return
+    except Exception:
+        return
+
+
+def _extract_seq_chunk(payload: bytes) -> tuple[int | None, bytes]:
+    if len(payload) < 2:
+        return None, b""
+    seq = int.from_bytes(payload[:2], "big")
+    return seq, payload[2:]
+
+
+def _handle_forward_conn(
+    local_conn: socket.socket,
+    client_addr: tuple[str, int],
+    server: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+    target_host: str,
+    target_port: int,
+    chunk_size: int,
+) -> None:
+    sid = None
+    try:
+        local_conn.settimeout(0.05)
+        sid = _establish_session(server, port, zone, timeout, attempts, qtype)
+        _stream_open(
+            sid,
+            server,
+            port,
+            zone,
+            timeout,
+            attempts,
+            qtype,
+            target_host,
+            target_port,
+        )
+        print(
+            f"[nexora-client] forward open local={client_addr[0]}:{client_addr[1]} sid={sid} target={target_host}:{target_port}"
+        )
+
+        seq_map: "OrderedDict[int, bytes]" = OrderedDict()
+        next_seq = 1
+        local_closed = False
+        idle_rounds = 0
+
+        while True:
+            outbound = b""
+            if not local_closed:
+                try:
+                    outbound = local_conn.recv(chunk_size)
+                    if outbound == b"":
+                        local_closed = True
+                except socket.timeout:
+                    outbound = b""
+
+            nonce = random_nonce()
+            pkt = pack_packet(TYPE_STREAM_SEND, sid, nonce, outbound)
+            _, resp = _query_txt(server, port, zone, timeout, pkt, attempts, qtype)
+            if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != nonce:
+                raise RuntimeError("stream recv mismatch")
+
+            seq, chunk = _extract_seq_chunk(resp.payload)
+            got_new = False
+            if seq is not None and chunk and seq not in seq_map:
+                seq_map[seq] = chunk
+                got_new = True
+
+            # Flush in-order chunks to local socket
+            while next_seq in seq_map:
+                local_conn.sendall(seq_map.pop(next_seq))
+                next_seq += 1
+
+            if got_new or outbound:
+                idle_rounds = 0
+            else:
+                idle_rounds += 1
+
+            if local_closed and idle_rounds >= 3:
+                break
+
+    except Exception as e:
+        print(f"[nexora-client] forward error {client_addr}: {e}")
+    finally:
+        if sid is not None:
+            _stream_close(sid, server, port, zone, timeout, attempts, qtype)
+        try:
+            local_conn.close()
+        except Exception:
+            pass
+
+
+def run_forward_server(
+    server: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+    listen_host: str,
+    listen_port: int,
+    target_host: str,
+    target_port: int,
+    chunk_size: int,
+) -> None:
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind((listen_host, listen_port))
+    lsock.listen(32)
+    print(
+        f"[nexora-client] forward server listening on {listen_host}:{listen_port} -> {target_host}:{target_port} via {server}:{port}"
+    )
+    while True:
+        conn, addr = lsock.accept()
+        t = threading.Thread(
+            target=_handle_forward_conn,
+            args=(
+                conn,
+                addr,
+                server,
+                port,
+                zone,
+                timeout,
+                attempts,
+                qtype,
+                target_host,
+                target_port,
+                chunk_size,
+            ),
+            daemon=True,
+        )
+        t.start()
 
 
 def run_tcp_test(
@@ -193,9 +374,27 @@ def main() -> None:
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
     p.add_argument("--tcp-chunk-size", type=int, default=24)
+    p.add_argument("--forward-listen-host", default="")
+    p.add_argument("--forward-listen-port", type=int, default=0)
+    p.add_argument("--forward-target-host", default="")
+    p.add_argument("--forward-target-port", type=int, default=0)
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
-    if args.tcp_test_host:
+    if args.forward_listen_port > 0 and args.forward_target_host and args.forward_target_port > 0:
+        run_forward_server(
+            args.server,
+            args.port,
+            args.zone,
+            args.timeout,
+            args.attempts,
+            qtype,
+            args.forward_listen_host or "0.0.0.0",
+            args.forward_listen_port,
+            args.forward_target_host,
+            args.forward_target_port,
+            args.tcp_chunk_size,
+        )
+    elif args.tcp_test_host:
         run_tcp_test(
             args.server,
             args.port,
