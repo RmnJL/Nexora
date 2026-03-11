@@ -549,6 +549,15 @@ def _handle_forward_conn(
                         "stream xfer sid=%d up=%d resp_type=%d resp_pay=%d",
                         sid, up_len, resp.msg_type, len(resp.payload),
                     )
+                    if resp.msg_type == TYPE_STREAM_CLOSE:
+                        log.info("server signalled stream close sid=%d", sid)
+                        local_closed = True
+                        idle_rounds = 1  # force immediate exit
+                        try:
+                            local_conn.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        break  # break from for-loop over done_set
                     if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != exp_nonce:
                         raise RuntimeError("stream recv mismatch")
 

@@ -383,8 +383,24 @@ def run_server(
             if packet.msg_type == TYPE_STREAM_SEND and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
                 if sess is None or sess.get("stream_sock") is None:
-                    log.debug("stream_send: session %d has no stream_sock", packet.session_id)
-                    ack = pack_packet(TYPE_STREAM_RECV, packet.session_id, packet.nonce, b"")
+                    # Drain any remaining downstream data first
+                    q = sess.get("down_q", deque()) if sess else deque()
+                    if q:
+                        max_payload = 140 if qtype == TYPE_TXT else 120
+                        out_payload = b""
+                        while q:
+                            seq, out_chunk = q[0]
+                            entry_body = seq.to_bytes(2, "big") + out_chunk
+                            entry = bytes([len(entry_body)]) + entry_body
+                            if len(out_payload) + len(entry) > max_payload:
+                                break
+                            q.popleft()
+                            out_payload += entry
+                        log.debug("stream_send: session %d draining q, %d bytes left", packet.session_id, len(q))
+                        ack = pack_packet(TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload)
+                    else:
+                        log.debug("stream_send: session %d backend dead, signalling close", packet.session_id)
+                        ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"")
                     sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                     continue
                 sessions.touch(packet.session_id)
