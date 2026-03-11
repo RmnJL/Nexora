@@ -67,6 +67,7 @@ class ResolverSelector:
         self._bad_until: dict[str, float] = {s: 0.0 for s in uniq}
         self._order: dict[str, int] = {s: i for i, s in enumerate(uniq)}
         self._rr_idx = 0
+        self._timeout_streak: dict[str, int] = {s: 0 for s in uniq}
 
     def _preferred_server_locked(self, now: float) -> str:
         good = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
@@ -107,12 +108,24 @@ class ResolverSelector:
         with self._lock:
             self._fails[server] = 0
             self._bad_until[server] = 0.0
+            self._timeout_streak[server] = 0
 
-    def report_failure(self, server: str) -> None:
+    def report_failure(self, server: str, is_timeout: bool = False) -> None:
         now = time.time()
         with self._lock:
             f = self._fails.get(server, 0) + 1
             self._fails[server] = f
+            if is_timeout:
+                streak = self._timeout_streak.get(server, 0) + 1
+                self._timeout_streak[server] = streak
+                if streak >= 3:
+                    # 3+ consecutive timeouts -> blacklist 60s
+                    self._bad_until[server] = now + 60.0
+                    if server == self._active:
+                        self._active = self._preferred_server_locked(now)
+                    return
+            else:
+                self._timeout_streak[server] = 0
             cooldown = self._fail_cooldown * min(f, 3)
             self._bad_until[server] = now + cooldown
             if server == self._active:
@@ -208,6 +221,7 @@ class ResolverSelector:
                     self._fails[s] = 0
                     self._bad_until[s] = 0.0
                     self._order[s] = len(self._order)
+                    self._timeout_streak[s] = 0
             if self._active not in uniq:
                 self._active = uniq[0]
             self._rr_idx = 0
@@ -301,12 +315,13 @@ def _query_txt(
         except Exception as e:
             last_err = e
             err_str = str(e)
+            is_timeout = "timed out" in err_str
             if "NXDOMAIN" in err_str:
                 selector.report_nxdomain(server)
             elif "no answer" in err_str:
                 selector.report_no_answer(server)
             else:
-                selector.report_failure(server)
+                selector.report_failure(server, is_timeout=is_timeout)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
             # Skip delay for NXDOMAIN/no-answer (server is blacklisted, try next immediately)
             if "NXDOMAIN" not in err_str and "no answer" not in err_str:
