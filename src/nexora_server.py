@@ -41,11 +41,10 @@ from nexora_proto import (
 
 log = logging.getLogger("nexora-server")
 
-# Keep this VERY short — the server is single-threaded and blocks on
-# every recv().  A long timeout (e.g. 0.5 s) means the entire DNS loop
-# stalls waiting for backend data.  With 0.005 s the server only grabs
-# data already in the socket buffer and moves on.
-STREAM_SOCK_TIMEOUT = 0.005
+# Keep this short — the server is single-threaded and blocks on
+# every recv().  0.05 s is enough to catch immediate backend responses
+# without stalling the DNS loop too long.
+STREAM_SOCK_TIMEOUT = 0.05
 STREAM_RECV_SLICE = 4096
 STREAM_RECV_ROUNDS = 3
 STREAM_RECV_MAX_BYTES = 8192

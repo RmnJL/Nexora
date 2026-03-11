@@ -90,9 +90,13 @@ def parse_query(packet: bytes) -> tuple[int, str, int]:
 def parse_answer_data(packet: bytes, expected_qid: int) -> str:
     if len(packet) < 12:
         raise ValueError("short dns answer")
-    qid, _flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", packet[:12])
+    qid, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", packet[:12])
     if qid != expected_qid:
         raise ValueError("mismatched id")
+    rcode = flags & 0x0F
+    if rcode != 0:
+        _rcode_names = {1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}
+        raise ValueError(f"dns rcode={rcode} ({_rcode_names.get(rcode, 'UNKNOWN')})")
     if qd != 1 or an < 1:
         raise ValueError("no answer")
 

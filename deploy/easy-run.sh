@@ -50,12 +50,12 @@ Client options:
   --resolver-switch-interval default: 300
   --resolver-probe-timeout   default: 1.6
   --resolver-probe-qtype     default: TXT
-  --tcp-chunk-size N         default: 110
+  --tcp-chunk-size N         default: 50
   --listen-host IP           default: 0.0.0.0
   --listen-port PORT         default: 1443
   --target-host IP           default: 127.0.0.1
   --target-port PORT         default: 8443
-  --max-conns N              default: 8
+  --max-conns N              default: 2
   --max-conns-per-ip N       default: 64
   --stream-open-retries N    default: 2
   --poll-min-interval SEC    default: 0.1
@@ -130,12 +130,12 @@ install_client() {
   local resolver_switch_interval="300"
   local resolver_probe_timeout="1.6"
   local resolver_probe_qtype="TXT"
-  local tcp_chunk_size="110"
+  local tcp_chunk_size="50"
   local listen_host="0.0.0.0"
   local listen_port="1443"
   local target_host="127.0.0.1"
   local target_port="8443"
-  local max_conns="8"
+  local max_conns="2"
   local max_conns_per_ip="64"
   local stream_open_retries="2"
   local poll_min_interval="0.1"
