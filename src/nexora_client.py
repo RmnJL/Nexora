@@ -71,6 +71,54 @@ def _sanitize_resolvers(items: list[str]) -> list[str]:
     return out
 
 
+def _extract_resolvers_from_scan_json(
+    data: dict,
+    min_pass_rate: float,
+    max_latency_ms: float,
+    min_score: float,
+) -> list[str]:
+    """Prefer quality-filtered resolver rows from scanner JSON.
+
+    Falls back to resolver_list when quality rows are not present.
+    """
+    rows = data.get("resolvers", [])
+    filtered: list[str] = []
+    seen: set[str] = set()
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ip = str(row.get("resolver", "")).strip()
+            if not _is_public_ipv4(ip) or ip in seen:
+                continue
+            try:
+                pass_rate = float(row.get("runtime_pass_rate"))
+            except (TypeError, ValueError):
+                pass_rate = None
+            try:
+                latency = float(row.get("latency_ms"))
+            except (TypeError, ValueError):
+                latency = None
+            try:
+                score = float(row.get("score"))
+            except (TypeError, ValueError):
+                score = None
+
+            if pass_rate is not None and pass_rate < min_pass_rate:
+                continue
+            if latency is not None and max_latency_ms > 0 and latency > max_latency_ms:
+                continue
+            if score is not None and score < min_score:
+                continue
+
+            seen.add(ip)
+            filtered.append(ip)
+
+    if filtered:
+        return filtered
+    return _sanitize_resolvers(data.get("resolver_list", []))
+
+
 class ResolverSelector:
     def __init__(
         self,
@@ -471,7 +519,11 @@ def _query_txt(
                 and "SERVFAIL" not in err_str
                 and "REFUSED" not in err_str
             ):
-                time.sleep(0.03 if idx < 3 else 0.5)
+                # Exponential backoff with jitter prevents retry storms
+                # when DNS path is degraded.
+                backoff = min(0.9, 0.04 * (2 ** min(5, idx)))
+                jitter = backoff * 0.25 * random.random()
+                time.sleep(backoff + jitter)
         finally:
             selector.release(server)
     used = len(tried_servers)
@@ -1099,6 +1151,24 @@ def main() -> None:
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
     p.add_argument("--resolver-probe-timeout", type=float, default=1.6)
     p.add_argument("--resolver-probe-qtype", choices=["TXT", "A"], default="TXT")
+    p.add_argument(
+        "--resolver-file-min-pass-rate",
+        type=float,
+        default=0.55,
+        help="minimum runtime_pass_rate to accept resolver rows from resolver file",
+    )
+    p.add_argument(
+        "--resolver-file-max-latency-ms",
+        type=float,
+        default=750.0,
+        help="maximum latency_ms to accept resolver rows from resolver file (<=0 disables)",
+    )
+    p.add_argument(
+        "--resolver-file-min-score",
+        type=float,
+        default=4.0,
+        help="minimum score to accept resolver rows from resolver file",
+    )
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     seed_resolvers = _sanitize_resolvers([x.strip() for x in args.server.split(",") if x.strip()])
@@ -1109,7 +1179,12 @@ def main() -> None:
         try:
             with open(args.resolver_file, "r") as f:
                 data = json.load(f)
-            file_resolvers = _sanitize_resolvers(data.get("resolver_list", []))
+            file_resolvers = _extract_resolvers_from_scan_json(
+                data,
+                min_pass_rate=max(0.0, min(1.0, args.resolver_file_min_pass_rate)),
+                max_latency_ms=args.resolver_file_max_latency_ms,
+                min_score=max(0.0, args.resolver_file_min_score),
+            )
             if file_resolvers:
                 log.info("loaded %d resolvers from %s", len(file_resolvers), args.resolver_file)
                 resolver_list = file_resolvers
@@ -1144,7 +1219,12 @@ def main() -> None:
                     last_mtime = mtime
                     with open(path, "r") as f:
                         data = json.load(f)
-                    new_list = _sanitize_resolvers(data.get("resolver_list", []))
+                    new_list = _extract_resolvers_from_scan_json(
+                        data,
+                        min_pass_rate=max(0.0, min(1.0, args.resolver_file_min_pass_rate)),
+                        max_latency_ms=args.resolver_file_max_latency_ms,
+                        min_score=max(0.0, args.resolver_file_min_score),
+                    )
                     if new_list:
                         if new_list != sel.servers:
                             sel.update_servers(new_list)

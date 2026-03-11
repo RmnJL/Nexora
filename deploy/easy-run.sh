@@ -53,6 +53,9 @@ Client options:
   --resolver-switch-interval default: 180
   --resolver-probe-timeout   default: 1.4
   --resolver-probe-qtype     default: TXT
+  --resolver-file-min-pass-rate default: 0.55
+  --resolver-file-max-latency-ms default: 750
+  --resolver-file-min-score  default: 4.0
   --tcp-chunk-size N         default: 100
   --listen-host IP           default: 0.0.0.0
   --listen-port PORT         default: 1443
@@ -140,6 +143,9 @@ install_client() {
   local resolver_probe_timeout="1.4"
   local resolver_probe_qtype="TXT"
   local tcp_chunk_size="100"
+  local resolver_file_min_pass_rate="0.55"
+  local resolver_file_max_latency_ms="750"
+  local resolver_file_min_score="4.0"
   local listen_host="0.0.0.0"
   local listen_port="1443"
   local target_host="127.0.0.1"
@@ -168,6 +174,9 @@ install_client() {
       --resolver-switch-interval) resolver_switch_interval="${2:?}"; shift 2 ;;
       --resolver-probe-timeout) resolver_probe_timeout="${2:?}"; shift 2 ;;
       --resolver-probe-qtype) resolver_probe_qtype="${2:?}"; shift 2 ;;
+      --resolver-file-min-pass-rate) resolver_file_min_pass_rate="${2:?}"; shift 2 ;;
+      --resolver-file-max-latency-ms) resolver_file_max_latency_ms="${2:?}"; shift 2 ;;
+      --resolver-file-min-score) resolver_file_min_score="${2:?}"; shift 2 ;;
       --tcp-chunk-size) tcp_chunk_size="${2:?}"; shift 2 ;;
       --listen-host) listen_host="${2:?}"; shift 2 ;;
       --listen-port) listen_port="${2:?}"; shift 2 ;;
@@ -207,6 +216,9 @@ NEXORA_RESOLVER_SWITCH_INTERVAL=${resolver_switch_interval}
 NEXORA_RESOLVER_PROBE_TIMEOUT=${resolver_probe_timeout}
 NEXORA_RESOLVER_PROBE_QTYPE=${resolver_probe_qtype}
 NEXORA_TCP_CHUNK_SIZE=${tcp_chunk_size}
+NEXORA_RESOLVER_FILE_MIN_PASS_RATE=${resolver_file_min_pass_rate}
+NEXORA_RESOLVER_FILE_MAX_LATENCY_MS=${resolver_file_max_latency_ms}
+NEXORA_RESOLVER_FILE_MIN_SCORE=${resolver_file_min_score}
 NEXORA_FORWARD_LISTEN_HOST=${listen_host}
 NEXORA_FORWARD_LISTEN_PORT=${listen_port}
 NEXORA_FORWARD_TARGET_HOST=${target_host}
