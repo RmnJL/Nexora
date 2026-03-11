@@ -481,6 +481,7 @@ def _handle_forward_conn(
         eager_pulls = 0
         next_pull_at = time.time()
         ever_received_data = False
+        data_in_flight = False  # ensure only 1 data query in flight (ordering)
 
         pool = ThreadPoolExecutor(max_workers=max(1, pipeline_depth))
         pending = {}  # {future: (nonce, up_len)}
@@ -497,7 +498,7 @@ def _handle_forward_conn(
                 # --- Fill pipeline with new queries ---
                 while len(pending) < pipeline_depth:
                     outbound = b""
-                    if not local_closed:
+                    if not local_closed and not data_in_flight:
                         try:
                             outbound = local_conn.recv(chunk_size)
                             if outbound == b"":
@@ -524,6 +525,8 @@ def _handle_forward_conn(
                         pkt, attempts, qtype,
                     )
                     pending[fut] = (nonce, len(outbound))
+                    if outbound:
+                        data_in_flight = True
                     next_pull_at = now2 + poll_wait
                     if not outbound:
                         break  # at most one empty poll per fill cycle
@@ -543,6 +546,8 @@ def _handle_forward_conn(
 
                 for f in done_set:
                     exp_nonce, up_len = pending.pop(f)
+                    if up_len > 0:
+                        data_in_flight = False
                     try:
                         _, resp = f.result()
                     except TimeoutError:
@@ -820,7 +825,7 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
-    p.add_argument("--tcp-chunk-size", type=int, default=35)
+    p.add_argument("--tcp-chunk-size", type=int, default=100)
     p.add_argument("--forward-listen-host", default="")
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
@@ -913,9 +918,10 @@ def main() -> None:
         log.info("resolver file watcher started: %s", args.resolver_file)
     global _dns_pacer
     _dns_pacer = _DnsQueryPacer(min_interval=args.dns_query_interval)
-    # Auto pipeline depth: cap at 4 to avoid overwhelming resolvers
+    # Auto pipeline depth: cap at 2 — keeps server load manageable and
+    # avoids upstream data reordering (only 1 data query in flight).
     if args.pipeline_depth <= 0:
-        args.pipeline_depth = max(2, min(4, len(resolver_list)))
+        args.pipeline_depth = max(1, min(2, len(resolver_list)))
         log.info("auto pipeline_depth=%d (from %d resolvers)", args.pipeline_depth, len(resolver_list))
     # Auto-scale attempts: try at least as many resolvers as available
     if len(resolver_list) > args.attempts:

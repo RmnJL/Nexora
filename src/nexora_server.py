@@ -46,9 +46,9 @@ from nexora_proto import (
 
 log = logging.getLogger("nexora-server")
 
-# Single-threaded server: keep recv timeout very short so empty polls
-# don't stall the DNS loop.  0.05 s lets the server handle ~20 qps.
-STREAM_SOCK_TIMEOUT = 0.05
+# Single-threaded server: keep recv timeout minimal.  The backend is on
+# localhost so data arrives in <1 ms; 10 ms catches everything.
+STREAM_SOCK_TIMEOUT = 0.01
 STREAM_RECV_SLICE = 4096
 STREAM_RECV_ROUNDS = 3
 STREAM_RECV_MAX_BYTES = 8192
