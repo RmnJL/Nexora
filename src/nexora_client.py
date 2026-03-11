@@ -670,6 +670,7 @@ def _handle_forward_conn(
         seq_map: "OrderedDict[int, bytes]" = OrderedDict()
         next_seq = 1
         local_closed = False
+        local_close_ts: float | None = None
         idle_rounds = 0
         last_activity = time.time()
         poll_wait = max(0.02, poll_min_interval)
@@ -687,6 +688,10 @@ def _handle_forward_conn(
                 now = time.time()
                 if idle_timeout > 0 and now - last_activity >= idle_timeout:
                     break
+                # Fast teardown after peer disconnect: avoid holding connection
+                # slots for stale DNS in-flight work and improve reconnect latency.
+                if local_closed and local_close_ts is not None and now - local_close_ts >= 1.5:
+                    break
                 # Kill zombie sessions: no downstream data 4s after session start
                 if not ever_received_data and now - session_start >= 4.0:
                     log.info("forward zombie sid=%d: no downstream after %.1fs", sid, now - session_start)
@@ -700,6 +705,7 @@ def _handle_forward_conn(
                             outbound = local_conn.recv(chunk_size)
                             if outbound == b"":
                                 local_closed = True
+                                local_close_ts = time.time()
                                 log.info("forward local closed sid=%d (clean FIN)", sid)
                             elif outbound:
                                 eager_pulls = max(eager_pulls, 4)
@@ -707,6 +713,7 @@ def _handle_forward_conn(
                             outbound = b""
                         except (ConnectionResetError, BrokenPipeError, OSError):
                             local_closed = True
+                            local_close_ts = time.time()
                             outbound = b""
                             log.info("forward local closed sid=%d (connection reset)", sid)
 
@@ -739,7 +746,10 @@ def _handle_forward_conn(
                 done_set, _ = _futures_wait(
                     pending.keys(),
                     return_when=FIRST_COMPLETED,
-                    timeout=timeout * max(1, attempts) + 3,
+                    timeout=min(
+                        timeout * max(1, attempts) + 3,
+                        max(0.8, timeout + 0.6) if local_closed else (timeout * max(1, attempts) + 3),
+                    ),
                 )
                 if not done_set:
                     raise TimeoutError("all DNS queries timed out")
@@ -762,6 +772,7 @@ def _handle_forward_conn(
                     if resp.msg_type == TYPE_STREAM_CLOSE:
                         log.info("server signalled stream close sid=%d", sid)
                         local_closed = True
+                        local_close_ts = time.time()
                         idle_rounds = 1  # force immediate exit
                         try:
                             local_conn.shutdown(socket.SHUT_RDWR)
@@ -792,6 +803,7 @@ def _handle_forward_conn(
                             local_conn.sendall(cdata)
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             local_closed = True
+                            local_close_ts = time.time()
                             break
                         next_seq += 1
 
@@ -832,7 +844,10 @@ def _handle_forward_conn(
         log.warning("forward error %s sid=%s: %s", client_addr, sid, e)
     finally:
         if sid is not None:
-            _stream_close(sid, selector, port, zone, timeout, attempts, qtype)
+            # Keep close best-effort and short to avoid reconnect delays when
+            # resolvers are unstable; server-side session TTL does final cleanup.
+            close_timeout = max(0.5, min(1.0, timeout * 0.5))
+            _stream_close(sid, selector, port, zone, close_timeout, 1, qtype)
         try:
             local_conn.close()
         except Exception:
