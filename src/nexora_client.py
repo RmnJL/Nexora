@@ -97,7 +97,8 @@ class ResolverSelector:
         with self._lock:
             pool = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
             if not pool:
-                pool = list(self._servers)
+                # All blacklisted — pick the one with fewest fails
+                pool = [min(self._servers, key=lambda s: self._fails.get(s, 0))]
             server = pool[self._rr_idx % len(pool)]
             self._rr_idx += 1
             return server
@@ -128,6 +129,18 @@ class ResolverSelector:
                 self._active = self._preferred_server_locked(now)
         if was_new:
             log.info("resolver NXDOMAIN blacklist %s for 300s", server)
+
+    def report_no_answer(self, server: str) -> None:
+        """Server returns empty answer — likely can't resolve our zone."""
+        now = time.time()
+        with self._lock:
+            was_new = self._fails.get(server, 0) < 50
+            self._fails[server] = 50
+            self._bad_until[server] = now + 120.0
+            if server == self._active:
+                self._active = self._preferred_server_locked(now)
+        if was_new:
+            log.info("resolver no-answer blacklist %s for 120s", server)
 
     def rotate_active(self) -> str:
         now = time.time()
@@ -287,12 +300,17 @@ def _query_txt(
             return qid, pkt
         except Exception as e:
             last_err = e
-            if "NXDOMAIN" in str(e):
+            err_str = str(e)
+            if "NXDOMAIN" in err_str:
                 selector.report_nxdomain(server)
+            elif "no answer" in err_str:
+                selector.report_no_answer(server)
             else:
                 selector.report_failure(server)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
-            time.sleep(0.03 if idx < 3 else 0.5)
+            # Skip delay for NXDOMAIN/no-answer (server is blacklisted, try next immediately)
+            if "NXDOMAIN" not in err_str and "no answer" not in err_str:
+                time.sleep(0.03 if idx < 3 else 0.5)
     raise TimeoutError(
         f"dns query failed after {attempts} attempts (last resolver {last_server}): {last_err}"
     )
@@ -895,7 +913,8 @@ def main() -> None:
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     resolver_list = [x.strip() for x in args.server.split(",") if x.strip()]
 
-    # Try loading from resolver file (scanner output) first
+    # Try loading from resolver file (scanner output) — MERGE with seed resolvers
+    seed_resolvers = list(resolver_list)  # keep CLI resolvers as priority
     if args.resolver_file and os.path.isfile(args.resolver_file):
         try:
             with open(args.resolver_file, "r") as f:
@@ -903,7 +922,12 @@ def main() -> None:
             file_resolvers = data.get("resolver_list", [])
             if file_resolvers:
                 log.info("loaded %d resolvers from %s", len(file_resolvers), args.resolver_file)
-                resolver_list = file_resolvers
+                # Seed resolvers first, then file resolvers (deduped)
+                merged = list(seed_resolvers)
+                for r in file_resolvers:
+                    if r not in merged:
+                        merged.append(r)
+                resolver_list = merged
         except Exception as e:
             log.warning("failed to read resolver file %s: %s", args.resolver_file, e)
 
@@ -911,7 +935,7 @@ def main() -> None:
 
     # Background watcher: reload resolvers when scanner updates the file
     if args.resolver_file:
-        def _watch_resolver_file(path: str, sel: ResolverSelector) -> None:
+        def _watch_resolver_file(path: str, sel: ResolverSelector, seeds: list[str]) -> None:
             last_mtime = 0.0
             while True:
                 time.sleep(30)
@@ -923,14 +947,19 @@ def main() -> None:
                     with open(path, "r") as f:
                         data = json.load(f)
                     new_list = data.get("resolver_list", [])
-                    if new_list and new_list != sel.servers:
-                        sel.update_servers(new_list)
+                    if new_list:
+                        merged = list(seeds)
+                        for r in new_list:
+                            if r not in merged:
+                                merged.append(r)
+                        if merged != sel.servers:
+                            sel.update_servers(merged)
                 except Exception:
                     pass
 
         wt = threading.Thread(
             target=_watch_resolver_file,
-            args=(args.resolver_file, selector),
+            args=(args.resolver_file, selector, seed_resolvers),
             daemon=True,
         )
         wt.start()
