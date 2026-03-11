@@ -293,6 +293,11 @@ def run_server(
                 sock.sendto(build_noerror_empty(data), addr)
                 continue
 
+            # Probe echo: scanner sends nxprobe-<nonce>, server echoes it
+            if encoded.startswith("nxprobe"):
+                sock.sendto(build_txt_answer(data, encoded, ttl=0), addr)
+                continue
+
             packet = unpack_packet(decode_dns_data(encoded))
             if packet.msg_type == TYPE_HELLO:
                 if not hello_limiter.allow(addr[0]):

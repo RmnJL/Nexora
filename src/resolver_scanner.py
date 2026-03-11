@@ -103,6 +103,7 @@ class ProbeResult:
     random_subdomain: bool = False
     tunnel_realistic: bool = False
     nxdomain_correct: bool = False
+    bidirectional: bool = False
     latency_ms: float = 9999.0
     score: int = 0
     error: Optional[str] = None
@@ -154,6 +155,84 @@ def _test_nxdomain(resolver: str, port: int, timeout: float) -> bool:
         return False
 
 
+def _extract_txt_strings(packet: bytes) -> list[bytes]:
+    """Extract TXT record strings from a DNS response."""
+    if len(packet) < 12:
+        return []
+    qdcount = struct.unpack(">H", packet[4:6])[0]
+    ancount = struct.unpack(">H", packet[6:8])[0]
+    if ancount == 0:
+        return []
+    # Skip header (12 bytes) then skip question section
+    pos = 12
+    for _ in range(qdcount):
+        while pos < len(packet):
+            length = packet[pos]
+            if length == 0:
+                pos += 1
+                break
+            if length >= 0xC0:  # compression pointer
+                pos += 2
+                break
+            pos += 1 + length
+        pos += 4  # QTYPE + QCLASS
+    # Parse answer RRs looking for TXT (type 16)
+    results: list[bytes] = []
+    for _ in range(ancount):
+        if pos >= len(packet):
+            break
+        # Skip name (handle compression)
+        while pos < len(packet):
+            length = packet[pos]
+            if length == 0:
+                pos += 1
+                break
+            if length >= 0xC0:
+                pos += 2
+                break
+            pos += 1 + length
+        if pos + 10 > len(packet):
+            break
+        rr_type = struct.unpack(">H", packet[pos:pos+2])[0]
+        rdlength = struct.unpack(">H", packet[pos+8:pos+10])[0]
+        pos += 10
+        if rr_type == _DNS_TYPE_TXT and pos + rdlength <= len(packet):
+            rdata = packet[pos:pos+rdlength]
+            # TXT RDATA: one or more <length><string> chunks
+            rpos = 0
+            while rpos < len(rdata):
+                slen = rdata[rpos]
+                rpos += 1
+                if rpos + slen <= len(rdata):
+                    results.append(rdata[rpos:rpos+slen])
+                rpos += slen
+        pos += rdlength
+    return results
+
+
+def _test_bidirectional(resolver: str, port: int,
+                       zone: str, timeout: float) -> bool:
+    """Verify the query reaches our server AND the response comes back.
+
+    Sends nxprobe-<nonce> to the zone; the nexora server echoes the nonce
+    in a TXT response.  If the echoed value matches, both directions work.
+    """
+    nonce = _rand_label(16)
+    fqdn = f"nxprobe-{nonce}.{zone}"
+    try:
+        rcode, resp = _dns_query(resolver, port, fqdn, _DNS_TYPE_TXT, timeout)
+        if rcode != 0:
+            return False
+        txt_strings = _extract_txt_strings(resp)
+        expected = f"nxprobe-{nonce}"
+        for s in txt_strings:
+            if expected.encode("ascii") in s:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _measure_latency(resolver: str, port: int,
                      zone: str, timeout: float, rounds: int = 3) -> float:
     """Measure median latency over multiple TXT queries to the zone."""
@@ -197,16 +276,23 @@ def probe_resolver(resolver: str, port: int, zone: str,
     # Test 4: NXDOMAIN correctness
     result.nxdomain_correct = _test_nxdomain(resolver, port, timeout)
 
+    # Test 5: Bidirectional — confirm our server echoes a nonce
+    if result.random_subdomain:
+        result.bidirectional = _test_bidirectional(
+            resolver, port, zone, timeout
+        )
+
     # Measure latency only if resolver passes subdomain test
     if result.random_subdomain:
         result.latency_ms = _measure_latency(resolver, port, zone, timeout)
 
-    # Score: 0-4 (each passed test = 1 point)
+    # Score: 0-5 (each passed test = 1 point)
     result.score = sum([
         result.reachable,
         result.random_subdomain,
         result.tunnel_realistic,
         result.nxdomain_correct,
+        result.bidirectional,
     ])
 
     return result
@@ -397,9 +483,9 @@ def run_scan(zone: str, port: int = 53, timeout: float = 3.0,
     )
     for i, r in enumerate(top):
         log.info(
-            "  #%d %s score=%d/4 latency=%.0fms tunnel=%s nxdomain=%s",
+            "  #%d %s score=%d/5 latency=%.0fms tunnel=%s nxdomain=%s bidir=%s",
             i + 1, r.resolver, r.score, r.latency_ms,
-            r.tunnel_realistic, r.nxdomain_correct,
+            r.tunnel_realistic, r.nxdomain_correct, r.bidirectional,
         )
 
     return ScanReport(
