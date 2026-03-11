@@ -590,7 +590,7 @@ def _handle_forward_conn(
                             poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
                         next_pull_at = time.time() + poll_wait
 
-                if local_closed and idle_rounds >= 1 and not pending:
+                if local_closed and idle_rounds >= 1:
                     break
         finally:
             for f in pending:
