@@ -23,8 +23,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from typing import Optional
-from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 log = logging.getLogger("nexora-scanner")
 
@@ -218,12 +216,11 @@ def probe_resolver(resolver: str, port: int, zone: str,
 # Resolver list management
 # ---------------------------------------------------------------------------
 
-# Tier 1+2 from SlipNet: known public + Iranian ISP resolvers (~230 IPs).
-# Tier 1 is mostly international (blocked from Iran), Tier 2 has Iranian
-# ISP resolvers which are the primary candidates.
-_SEED_RESOLVERS_URL = (
-    "https://raw.githubusercontent.com/anonvector/SlipNet"
-    "/main/app/src/main/res/raw/resolvers.txt"
+# Local resolver list shipped with the project (data/resolvers.txt).
+# Contains ~33K IPs in 3 tiers from SlipNet.
+_LOCAL_RESOLVERS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "resolvers.txt",
 )
 
 # Hardcoded fallback: known-good resolvers from Iran
@@ -261,17 +258,8 @@ def _is_valid_ip(ip: str) -> bool:
     return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
-def _fetch_resolver_list(url: str, timeout: float = 15.0,
-                         tier3_sample: int = 200) -> list[str]:
-    """Download resolver list from URL, parse tiers, sample tier 3."""
-    try:
-        req = Request(url, headers={"User-Agent": "Nexora-Scanner/1.0"})
-        with urlopen(req, timeout=timeout) as resp:
-            text = resp.read().decode("utf-8", errors="ignore")
-    except (URLError, OSError) as e:
-        log.warning("failed to fetch resolver list: %s", e)
-        return []
-
+def _parse_resolver_text(text: str, tier3_sample: int = 200) -> list[str]:
+    """Parse resolver list text, split into tiers, sample tier 3."""
     resolvers: list[str] = []
     boundaries: list[int] = []
     seen: set[str] = set()
@@ -316,12 +304,31 @@ def _fetch_resolver_list(url: str, timeout: float = 15.0,
     return result
 
 
-def load_resolvers(url: str, tier3_sample: int = 200) -> list[str]:
-    """Load resolver list from URL with fallback to hardcoded list."""
-    resolvers = _fetch_resolver_list(url, tier3_sample=tier3_sample)
+def load_resolvers(resolver_file: str = "",
+                   tier3_sample: int = 200) -> list[str]:
+    """Load resolver list from local file with fallback to hardcoded list."""
+    # Try explicit path first, then bundled data/resolvers.txt
+    paths_to_try = []
+    if resolver_file:
+        paths_to_try.append(resolver_file)
+    paths_to_try.append(_LOCAL_RESOLVERS_FILE)
+
+    resolvers: list[str] = []
+    for path in paths_to_try:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+                resolvers = _parse_resolver_text(text, tier3_sample=tier3_sample)
+                if resolvers:
+                    log.info("loaded %d resolvers from %s", len(resolvers), path)
+                    break
+            except OSError as e:
+                log.warning("failed to read %s: %s", path, e)
+
     if not resolvers:
         log.warning("using fallback resolver list (%d IPs)", len(_FALLBACK_RESOLVERS))
-        return list(_FALLBACK_RESOLVERS)
+        resolvers = list(_FALLBACK_RESOLVERS)
 
     # Ensure fallback resolvers are always included (at front)
     seen = set(resolvers)
@@ -346,10 +353,10 @@ class ScanReport:
 
 def run_scan(zone: str, port: int = 53, timeout: float = 3.0,
              concurrency: int = 10, top_n: int = 5,
-             url: str = _SEED_RESOLVERS_URL,
+             resolver_file: str = "",
              tier3_sample: int = 200) -> ScanReport:
     """Scan resolvers and return ranked results."""
-    candidates = load_resolvers(url, tier3_sample=tier3_sample)
+    candidates = load_resolvers(resolver_file, tier3_sample=tier3_sample)
     log.info("scanning %d resolvers for zone=%s ...", len(candidates), zone)
 
     results: list[ProbeResult] = []
@@ -473,8 +480,8 @@ def main() -> None:
         help="how many tier-3 resolvers to sample (default: 200)",
     )
     p.add_argument(
-        "--url", default=_SEED_RESOLVERS_URL,
-        help="URL to fetch resolver list from",
+        "--resolver-file", default="",
+        help="path to resolvers.txt (default: data/resolvers.txt in project)",
     )
     p.add_argument(
         "--loop", type=float, default=0,
@@ -495,7 +502,7 @@ def main() -> None:
                     timeout=args.timeout,
                     concurrency=args.concurrency,
                     top_n=args.top,
-                    url=args.url,
+                    resolver_file=args.resolver_file,
                     tier3_sample=args.tier3_sample,
                 )
                 write_report(report, args.output)
@@ -509,7 +516,7 @@ def main() -> None:
             timeout=args.timeout,
             concurrency=args.concurrency,
             top_n=args.top,
-            url=args.url,
+            resolver_file=args.resolver_file,
             tier3_sample=args.tier3_sample,
         )
         write_report(report, args.output)
