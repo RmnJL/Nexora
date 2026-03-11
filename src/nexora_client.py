@@ -92,14 +92,27 @@ class ResolverSelector:
                 self._active = preferred
             return self._active
 
-    def choose_next(self) -> str:
-        """Round-robin across healthy resolvers to distribute load."""
+    def choose_next(self, exclude: set | None = None) -> str | None:
+        """Round-robin across healthy resolvers to distribute load.
+
+        *exclude* — servers to skip (e.g. NXDOMAIN in this call).
+        Returns ``None`` when every server is excluded.
+        """
         now = time.time()
         with self._lock:
-            pool = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
+            pool = [
+                s for s in self._servers
+                if now >= self._bad_until.get(s, 0.0)
+                and (not exclude or s not in exclude)
+            ]
             if not pool:
-                # All blacklisted — pick the one with fewest fails
-                pool = [min(self._servers, key=lambda s: self._fails.get(s, 0))]
+                # Try non-excluded but still blacklisted
+                pool = [
+                    s for s in self._servers
+                    if not exclude or s not in exclude
+                ]
+            if not pool:
+                return None  # every server excluded
             server = pool[self._rr_idx % len(pool)]
             self._rr_idx += 1
             return server
@@ -305,8 +318,12 @@ def _query_txt(
 ) -> tuple[int, object]:
     last_err = None
     last_server = ""
+    dead_servers: set[str] = set()  # NXDOMAIN / no-answer this call
     for idx in range(max(1, attempts)):
-        server = selector.choose_next()
+        server = selector.choose_next(exclude=dead_servers)
+        if server is None:
+            # Every resolver returned NXDOMAIN / no-answer — bail early
+            break
         last_server = server
         try:
             qid, pkt = _query_pkt_direct(server, port, zone, timeout, payload, qtype)
@@ -318,8 +335,10 @@ def _query_txt(
             is_timeout = "timed out" in err_str
             if "NXDOMAIN" in err_str:
                 selector.report_nxdomain(server)
+                dead_servers.add(server)
             elif "no answer" in err_str:
                 selector.report_no_answer(server)
+                dead_servers.add(server)
             else:
                 selector.report_failure(server, is_timeout=is_timeout)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
@@ -941,6 +960,7 @@ def main() -> None:
             log.warning("failed to read resolver file %s: %s, using CLI resolvers", args.resolver_file, e)
 
     selector = ResolverSelector(resolver_list, fail_cooldown=args.resolver_fail_cooldown)
+    log.info("active resolvers (%d): %s", len(resolver_list), ", ".join(resolver_list))
 
     # Background watcher: reload resolvers when scanner updates the file
     if args.resolver_file:
