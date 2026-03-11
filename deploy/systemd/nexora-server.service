@@ -13,8 +13,9 @@ Environment="NEXORA_PORT=53"
 Environment="NEXORA_ZONE=t1.phonexpress.ir"
 Environment="NEXORA_SESSION_TTL=900"
 Environment="NEXORA_CLEANUP_INTERVAL=60"
+Environment="NEXORA_LOG_LEVEL=WARNING"
 EnvironmentFile=-/etc/default/nexora-server
-ExecStart=/usr/bin/python3 -u ${NEXORA_SERVER_PY} --bind ${NEXORA_BIND} --port ${NEXORA_PORT} --zone ${NEXORA_ZONE} --session-ttl ${NEXORA_SESSION_TTL} --cleanup-interval ${NEXORA_CLEANUP_INTERVAL}
+ExecStart=/usr/bin/python3 -u ${NEXORA_SERVER_PY} --bind ${NEXORA_BIND} --port ${NEXORA_PORT} --zone ${NEXORA_ZONE} --session-ttl ${NEXORA_SESSION_TTL} --cleanup-interval ${NEXORA_CLEANUP_INTERVAL} --log-level ${NEXORA_LOG_LEVEL}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535

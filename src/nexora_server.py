@@ -308,7 +308,7 @@ def run_server(
                 ack = pack_packet(TYPE_HELLO_ACK, sid, packet.nonce, b"OK")
                 answer = _make_dns_answer(data, qtype, ack)
                 sock.sendto(answer, addr)
-                log.info(
+                log.debug(
                     "hello from %s:%d -> session=%d", addr[0], addr[1], sid
                 )
                 continue
@@ -443,7 +443,7 @@ def run_server(
                             break
                         q.popleft()
                         out_payload += entry
-                    log.info(
+                    log.debug(
                         "stream data sid=%d up=%d down=%d q=%d",
                         packet.session_id, len(packet.payload), len(recv_data), len(q),
                     )
@@ -495,14 +495,16 @@ def run_server(
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
     p = argparse.ArgumentParser(description="Nexora phase-1 server")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="logging verbosity (default: INFO)",
+    )
     p.add_argument(
         "--session-ttl",
         type=float,
@@ -516,6 +518,10 @@ def main() -> None:
         help="run session cleanup every N seconds",
     )
     args = p.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
     run_server(
         args.bind,
         args.port,

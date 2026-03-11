@@ -37,6 +37,7 @@ Server options:
   --zone DOMAIN              default: t1.phonexpress.ir
   --session-ttl SECONDS      default: 900
   --cleanup-interval SECONDS default: 60
+  --log-level LEVEL          default: WARNING
 
 Client options:
   --resolvers CSV            default: 185.49.84.2,91.92.209.5,91.92.209.194
@@ -88,6 +89,7 @@ install_server() {
   local zone="t1.phonexpress.ir"
   local session_ttl="900"
   local cleanup_interval="60"
+  local log_level="WARNING"
   local server_py="/root/Nexora/src/nexora_server.py"
 
   while [[ $# -gt 0 ]]; do
@@ -97,6 +99,7 @@ install_server() {
       --zone) zone="${2:?}"; shift 2 ;;
       --session-ttl) session_ttl="${2:?}"; shift 2 ;;
       --cleanup-interval) cleanup_interval="${2:?}"; shift 2 ;;
+      --log-level) log_level="${2:?}"; shift 2 ;;
       *) echo "Unknown option for server: $1"; usage; exit 1 ;;
     esac
   done
@@ -115,6 +118,7 @@ NEXORA_PORT=${port}
 NEXORA_ZONE=${zone}
 NEXORA_SESSION_TTL=${session_ttl}
 NEXORA_CLEANUP_INTERVAL=${cleanup_interval}
+NEXORA_LOG_LEVEL=${log_level}
 EOF
   echo "[easy-run] installed ${SERVER_UNIT_DST}"
   echo "[easy-run] wrote ${SERVER_ENV}"
