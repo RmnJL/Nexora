@@ -112,7 +112,7 @@ class ResolverSelector:
         with self._lock:
             f = self._fails.get(server, 0) + 1
             self._fails[server] = f
-            cooldown = self._fail_cooldown * min(f, 6)
+            cooldown = self._fail_cooldown * min(f, 3)
             self._bad_until[server] = now + cooldown
             if server == self._active:
                 self._active = self._preferred_server_locked(now)
@@ -277,7 +277,7 @@ def _query_txt(
             last_err = e
             selector.report_failure(server)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
-            time.sleep(0.03)
+            time.sleep(0.03 if idx < 3 else 0.5)
     raise TimeoutError(
         f"dns query failed after {attempts} attempts (last resolver {last_server}): {last_err}"
     )
@@ -879,9 +879,9 @@ def main() -> None:
         log.info("resolver file watcher started: %s", args.resolver_file)
     global _dns_pacer
     _dns_pacer = _DnsQueryPacer(min_interval=args.dns_query_interval)
-    # Auto pipeline depth: match number of resolvers for maximum parallelism
+    # Auto pipeline depth: cap at 4 to avoid overwhelming resolvers
     if args.pipeline_depth <= 0:
-        args.pipeline_depth = max(2, len(resolver_list))
+        args.pipeline_depth = max(2, min(4, len(resolver_list)))
         log.info("auto pipeline_depth=%d (from %d resolvers)", args.pipeline_depth, len(resolver_list))
     # Auto-scale attempts: try at least as many resolvers as available
     if len(resolver_list) > args.attempts:
