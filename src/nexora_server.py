@@ -46,17 +46,17 @@ from nexora_proto import (
 
 log = logging.getLogger("nexora-server")
 
-# Single-threaded server: balance between catching backend responses
-# and not stalling the DNS loop.  With query pacer on the client side
-# limiting to ~7 qps, 0.1 s per recv is acceptable.
-STREAM_SOCK_TIMEOUT = 0.3
+# Single-threaded server: keep recv timeout very short so empty polls
+# don't stall the DNS loop.  0.05 s lets the server handle ~20 qps.
+STREAM_SOCK_TIMEOUT = 0.05
 STREAM_RECV_SLICE = 4096
 STREAM_RECV_ROUNDS = 3
 STREAM_RECV_MAX_BYTES = 8192
-# Downstream chunk MUST stay small enough so the base32-encoded response
-# fits in a DNS answer.  TXT: max 254 base32 chars -> 158 raw -> 143 payload.
-# CNAME: max ~220 base32 chars -> 137 raw -> 122 payload.
-DOWNSTREAM_CHUNK_SIZE = 100
+# Downstream chunk size chosen so that exactly TWO chunks fit inside a
+# single TXT DNS answer: entry = 1(len) + 2(seq) + 67(data) = 70 bytes,
+# 70*2 = 140 = max TXT payload.  This gives 134 bytes/response (was 100).
+# For CNAME (max_payload=120) only 1 chunk fits -> 67 bytes (acceptable).
+DOWNSTREAM_CHUNK_SIZE = 67
 
 # Rate limiting: max HELLO requests per source IP within window.
 # NOTE: in DNS tunneling, source IP = resolver, not real client.

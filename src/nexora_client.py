@@ -480,6 +480,7 @@ def _handle_forward_conn(
         poll_ceiling = max(poll_wait, poll_max_interval)
         eager_pulls = 0
         next_pull_at = time.time()
+        ever_received_data = False
 
         pool = ThreadPoolExecutor(max_workers=max(1, pipeline_depth))
         pending = {}  # {future: (nonce, up_len)}
@@ -487,6 +488,10 @@ def _handle_forward_conn(
             while True:
                 now = time.time()
                 if idle_timeout > 0 and now - last_activity >= idle_timeout:
+                    break
+                # Kill zombie sessions: no downstream data 5 s after last upstream send
+                if not ever_received_data and now - last_activity >= 5.0:
+                    log.info("forward zombie sid=%d: no downstream data", sid)
                     break
 
                 # --- Fill pipeline with new queries ---
@@ -590,6 +595,8 @@ def _handle_forward_conn(
                         last_activity = time.time()
                         poll_wait = max(0.02, poll_min_interval)
                         next_pull_at = time.time() + poll_wait
+                        if got_new:
+                            ever_received_data = True
                     else:
                         idle_rounds += 1
                         if eager_pulls > 0:
