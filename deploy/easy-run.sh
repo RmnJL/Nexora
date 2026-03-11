@@ -39,18 +39,18 @@ Server options:
   --cleanup-interval SECONDS default: 60
 
 Client options:
-  --resolvers CSV            default: 185.49.84.2
+  --resolvers CSV            default: 185.49.84.2,91.92.209.5,91.92.209.194
   --port PORT                default: 53
   --zone DOMAIN              default: t1.phonexpress.ir
   --qtype TXT|A              default: TXT
   --timeout SECONDS          default: 3
-  --attempts N               default: 2
+  --attempts N               default: 3
   --resolver-fail-cooldown   default: 20
   --resolver-health-interval default: 120
   --resolver-switch-interval default: 300
   --resolver-probe-timeout   default: 1.6
   --resolver-probe-qtype     default: TXT
-  --tcp-chunk-size N         default: 24
+  --tcp-chunk-size N         default: 12
   --listen-host IP           default: 0.0.0.0
   --listen-port PORT         default: 1443
   --target-host IP           default: 127.0.0.1
@@ -120,18 +120,18 @@ EOF
 }
 
 install_client() {
-  local resolvers="185.49.84.2"
+  local resolvers="185.49.84.2,91.92.209.5,91.92.209.194"
   local port="53"
   local zone="t1.phonexpress.ir"
   local qtype="TXT"
   local timeout="3"
-  local attempts="2"
+  local attempts="3"
   local resolver_fail_cooldown="20"
   local resolver_health_interval="120"
   local resolver_switch_interval="300"
   local resolver_probe_timeout="1.6"
   local resolver_probe_qtype="TXT"
-  local tcp_chunk_size="24"
+  local tcp_chunk_size="12"
   local listen_host="0.0.0.0"
   local listen_port="1443"
   local target_host="127.0.0.1"

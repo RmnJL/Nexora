@@ -12,6 +12,8 @@ from typing import Tuple
 TYPE_TXT = 16
 TYPE_A = 1
 TYPE_CNAME = 5
+TYPE_NS = 2
+TYPE_SOA = 6
 CLASS_IN = 1
 
 
@@ -135,6 +137,45 @@ def build_servfail(request: bytes) -> bytes:
     _, off = _decode_name(request, 12)
     end = off + 4
     return qid + flags + counts + request[12:end]
+
+
+def build_noerror_empty(request: bytes) -> bytes:
+    """NOERROR with AA flag and 0 answers — prevents negative caching."""
+    qid = request[:2]
+    flags = struct.pack(">H", 0x8500)
+    counts = struct.pack(">HHHH", 1, 0, 0, 0)
+    _, off = _decode_name(request, 12)
+    end = off + 4
+    return qid + flags + counts + request[12:end]
+
+
+def build_soa_answer(request: bytes, zone: str, ttl: int = 300) -> bytes:
+    """Minimal SOA response so resolvers recognise the zone as valid."""
+    qid = request[:2]
+    flags = struct.pack(">H", 0x8500)
+    counts = struct.pack(">HHHH", 1, 1, 0, 0)
+    _qname, off = _decode_name(request, 12)
+    qsec = request[12:off + 4]
+    name_ptr = struct.pack(">H", 0xC00C)
+    mname = _encode_name("ns1." + zone.strip("."))
+    rname = _encode_name("admin." + zone.strip("."))
+    soa_fixed = struct.pack(">IIIII", 2026031101, 3600, 600, 86400, ttl)
+    rdata = mname + rname + soa_fixed
+    rr_hdr = struct.pack(">HHIH", TYPE_SOA, CLASS_IN, ttl, len(rdata))
+    return qid + flags + counts + qsec + name_ptr + rr_hdr + rdata
+
+
+def build_ns_answer(request: bytes, zone: str, ttl: int = 300) -> bytes:
+    """Minimal NS response for the zone."""
+    qid = request[:2]
+    flags = struct.pack(">H", 0x8500)
+    counts = struct.pack(">HHHH", 1, 1, 0, 0)
+    _qname, off = _decode_name(request, 12)
+    qsec = request[12:off + 4]
+    name_ptr = struct.pack(">H", 0xC00C)
+    ns_name = _encode_name("ns1." + zone.strip("."))
+    rr_hdr = struct.pack(">HHIH", TYPE_NS, CLASS_IN, ttl, len(ns_name))
+    return qid + flags + counts + qsec + name_ptr + rr_hdr + ns_name
 
 
 def build_txt_answer(request: bytes, txt_data: str, ttl: int = 0) -> bytes:

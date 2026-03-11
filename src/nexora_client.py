@@ -716,7 +716,7 @@ def main() -> None:
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
     p.add_argument("--timeout", type=float, default=3.0)
-    p.add_argument("--attempts", type=int, default=2)
+    p.add_argument("--attempts", type=int, default=3)
     p.add_argument("--qtype", choices=["TXT", "A"], default="TXT")
     p.add_argument("--tcp-test-host", default="")
     p.add_argument("--tcp-test-port", type=int, default=80)
@@ -724,7 +724,7 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
-    p.add_argument("--tcp-chunk-size", type=int, default=24)
+    p.add_argument("--tcp-chunk-size", type=int, default=12)
     p.add_argument("--forward-listen-host", default="")
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")

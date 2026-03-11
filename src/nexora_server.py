@@ -17,9 +17,13 @@ from collections import deque
 
 from dns_wire import (
     TYPE_A,
+    TYPE_NS,
+    TYPE_SOA,
     TYPE_TXT,
     build_cname_answer,
-    build_servfail,
+    build_noerror_empty,
+    build_ns_answer,
+    build_soa_answer,
     build_txt_answer,
     parse_query,
 )
@@ -275,18 +279,24 @@ def run_server(
             last_cleanup = now
         try:
             qid, qname, qtype = parse_query(data)
+            if qtype == TYPE_NS:
+                sock.sendto(build_ns_answer(data, zone), addr)
+                continue
+            if qtype == TYPE_SOA:
+                sock.sendto(build_soa_answer(data, zone), addr)
+                continue
             if qtype not in (TYPE_TXT, TYPE_A):
-                sock.sendto(build_servfail(data), addr)
+                sock.sendto(build_noerror_empty(data), addr)
                 continue
             encoded = _extract_encoded_chunk(qname, zone)
             if not encoded:
-                sock.sendto(build_servfail(data), addr)
+                sock.sendto(build_noerror_empty(data), addr)
                 continue
 
             packet = unpack_packet(decode_dns_data(encoded))
             if packet.msg_type == TYPE_HELLO:
                 if not hello_limiter.allow(addr[0]):
-                    sock.sendto(build_servfail(data), addr)
+                    sock.sendto(build_noerror_empty(data), addr)
                     continue
                 sid = sessions.new(addr)
                 ack = pack_packet(TYPE_HELLO_ACK, sid, packet.nonce, b"OK")
@@ -300,7 +310,7 @@ def run_server(
             if packet.msg_type == TYPE_DATA and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
                 if sess is None:
-                    sock.sendto(build_servfail(data), addr)
+                    sock.sendto(build_noerror_empty(data), addr)
                     continue
                 sessions.touch(packet.session_id)
                 cached = _cache_get(sess, TYPE_DATA, packet.nonce)
@@ -319,7 +329,7 @@ def run_server(
             if packet.msg_type == TYPE_STREAM_OPEN and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
                 if sess is None:
-                    sock.sendto(build_servfail(data), addr)
+                    sock.sendto(build_noerror_empty(data), addr)
                     continue
                 sessions.touch(packet.session_id)
                 cached = _cache_get(sess, TYPE_STREAM_OPEN, packet.nonce)
@@ -367,8 +377,8 @@ def run_server(
             if packet.msg_type == TYPE_STREAM_SEND and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
                 if sess is None or sess.get("stream_sock") is None:
-                    log.warning("stream_send: session %d has no stream_sock, SERVFAIL", packet.session_id)
-                    sock.sendto(build_servfail(data), addr)
+                    log.warning("stream_send: session %d has no stream_sock", packet.session_id)
+                    sock.sendto(build_noerror_empty(data), addr)
                     continue
                 sessions.touch(packet.session_id)
                 cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
@@ -442,11 +452,11 @@ def run_server(
                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                 continue
 
-            sock.sendto(build_servfail(data), addr)
+            sock.sendto(build_noerror_empty(data), addr)
         except Exception:
             log.warning("packet parse/handle error from %s", addr, exc_info=True)
             try:
-                sock.sendto(build_servfail(data), addr)
+                sock.sendto(build_noerror_empty(data), addr)
             except Exception:
                 pass
 
