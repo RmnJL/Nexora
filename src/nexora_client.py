@@ -199,25 +199,27 @@ class ResolverSelector:
 
 
 class _DnsQueryPacer:
-    """Enforce minimum interval between DNS queries across all threads.
+    """Per-resolver rate limiter.
 
-    Prevents flooding resolvers which triggers anti-tunnel detection.
+    Each resolver gets its own independent pacing so that N resolvers
+    yield N times the throughput of a single resolver.
     """
 
     def __init__(self, min_interval: float = 0.15) -> None:
         self._lock = Lock()
-        self._next_send = 0.0
         self._interval = min_interval
+        self._next_send: dict[str, float] = {}  # per-resolver
 
-    def pace(self) -> None:
+    def pace(self, resolver: str = "") -> None:
         with self._lock:
             now = time.time()
-            if now < self._next_send:
-                wait = self._next_send - now
-                self._next_send += self._interval
+            ns = self._next_send.get(resolver, 0.0)
+            if now < ns:
+                wait = ns - now
+                self._next_send[resolver] = ns + self._interval
             else:
                 wait = 0.0
-                self._next_send = now + self._interval
+                self._next_send[resolver] = now + self._interval
         if wait > 0:
             time.sleep(wait)
 
@@ -237,7 +239,7 @@ def _query_pkt_direct(
     fqdn = f"{chunk_label(encoded)}.{zone.strip('.')}"
     qid, query = build_query(fqdn, qtype=qtype)
     if _dns_pacer is not None:
-        _dns_pacer.pace()
+        _dns_pacer.pace(server)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
@@ -820,8 +822,8 @@ def main() -> None:
     p.add_argument(
         "--pipeline-depth",
         type=int,
-        default=2,
-        help="number of concurrent DNS queries per stream (pipelining)",
+        default=0,
+        help="concurrent DNS queries per stream; 0=auto (match resolver count)",
     )
     p.add_argument(
         "--resolver-file", default="",
@@ -878,6 +880,10 @@ def main() -> None:
         log.info("resolver file watcher started: %s", args.resolver_file)
     global _dns_pacer
     _dns_pacer = _DnsQueryPacer(min_interval=args.dns_query_interval)
+    # Auto pipeline depth: match number of resolvers for maximum parallelism
+    if args.pipeline_depth <= 0:
+        args.pipeline_depth = max(2, len(resolver_list))
+        log.info("auto pipeline_depth=%d (from %d resolvers)", args.pipeline_depth, len(resolver_list))
     probe_qtype = TYPE_A if args.resolver_probe_qtype == "A" else TYPE_TXT
 
     if len(resolver_list) > 1:
