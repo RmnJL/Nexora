@@ -14,6 +14,7 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait, FIRST_COMPLETED
 from threading import Lock
 
 from dns_wire import TYPE_A, TYPE_TXT, build_query, parse_answer_data
@@ -404,6 +405,7 @@ def _handle_forward_conn(
     poll_min_interval: float,
     poll_max_interval: float,
     idle_timeout: float,
+    pipeline_depth: int = 1,
 ) -> None:
     sid = None
     try:
@@ -445,83 +447,116 @@ def _handle_forward_conn(
         eager_pulls = 0
         next_pull_at = time.time()
 
-        while True:
-            now = time.time()
-            if idle_timeout > 0 and now - last_activity >= idle_timeout:
-                break
+        pool = ThreadPoolExecutor(max_workers=max(1, pipeline_depth))
+        pending = {}  # {future: (nonce, up_len)}
+        try:
+            while True:
+                now = time.time()
+                if idle_timeout > 0 and now - last_activity >= idle_timeout:
+                    break
 
-            outbound = b""
-            if not local_closed:
-                try:
-                    outbound = local_conn.recv(chunk_size)
-                    if outbound == b"":
-                        local_closed = True
-                    elif outbound:
-                        # After local upstream bytes, keep a few fast pulls
-                        # to capture delayed downstream handshake responses.
-                        eager_pulls = max(eager_pulls, 4)
-                except socket.timeout:
+                # --- Fill pipeline with new queries ---
+                while len(pending) < pipeline_depth:
                     outbound = b""
+                    if not local_closed:
+                        try:
+                            outbound = local_conn.recv(chunk_size)
+                            if outbound == b"":
+                                local_closed = True
+                            elif outbound:
+                                eager_pulls = max(eager_pulls, 4)
+                        except socket.timeout:
+                            outbound = b""
 
-            # Do not hammer resolvers with tight empty polling loops.
-            now = time.time()
-            should_poll = bool(outbound) or now >= next_pull_at
-            if not should_poll:
-                time.sleep(min(0.05, max(0.0, next_pull_at - now)))
-                continue
+                    now2 = time.time()
+                    should_send = bool(outbound) or now2 >= next_pull_at
+                    if not should_send:
+                        break
 
-            nonce = random_nonce()
-            pkt = pack_packet(TYPE_STREAM_SEND, sid, nonce, outbound)
-            _, resp = _query_txt(selector, port, zone, timeout, pkt, attempts, qtype)
-            log.info(
-                "stream xfer sid=%d up=%d resp_type=%d resp_pay=%d",
-                sid, len(outbound), resp.msg_type, len(resp.payload),
-            )
-            if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != nonce:
-                raise RuntimeError("stream recv mismatch")
+                    nonce = random_nonce()
+                    pkt = pack_packet(TYPE_STREAM_SEND, sid, nonce, outbound)
+                    fut = pool.submit(
+                        _query_txt, selector, port, zone, timeout,
+                        pkt, attempts, qtype,
+                    )
+                    pending[fut] = (nonce, len(outbound))
+                    next_pull_at = now2 + poll_wait
+                    if not outbound:
+                        break  # at most one empty poll per fill cycle
 
-            seq, chunk = _extract_seq_chunk(resp.payload)
-            got_new = False
-            if seq is not None and chunk and seq not in seq_map:
-                seq_map[seq] = chunk
-                got_new = True
+                # --- Wait for results ---
+                if not pending:
+                    time.sleep(min(0.05, max(0.0, next_pull_at - time.time())))
+                    continue
 
-            # Try multi-chunk parse for packed responses with >1 entry.
-            if len(resp.payload) > (1 + 2 + len(chunk if chunk else b"")):
-                for mseq, mchunk in _extract_seq_chunks(resp.payload):
-                    if mseq not in seq_map:
-                        seq_map[mseq] = mchunk
+                done_set, _ = _futures_wait(
+                    pending.keys(),
+                    return_when=FIRST_COMPLETED,
+                    timeout=timeout * max(1, attempts) + 3,
+                )
+                if not done_set:
+                    raise TimeoutError("all DNS queries timed out")
+
+                for f in done_set:
+                    exp_nonce, up_len = pending.pop(f)
+                    try:
+                        _, resp = f.result()
+                    except TimeoutError:
+                        for pf in pending:
+                            pf.cancel()
+                        pending.clear()
+                        raise
+                    log.info(
+                        "stream xfer sid=%d up=%d resp_type=%d resp_pay=%d",
+                        sid, up_len, resp.msg_type, len(resp.payload),
+                    )
+                    if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != exp_nonce:
+                        raise RuntimeError("stream recv mismatch")
+
+                    seq, chunk = _extract_seq_chunk(resp.payload)
+                    got_new = False
+                    if seq is not None and chunk and seq not in seq_map:
+                        seq_map[seq] = chunk
                         got_new = True
 
-            while len(seq_map) > SEQ_MAP_MAX_SIZE:
-                seq_map.popitem(last=False)
+                    if len(resp.payload) > (1 + 2 + len(chunk if chunk else b"")):
+                        for mseq, mchunk in _extract_seq_chunks(resp.payload):
+                            if mseq not in seq_map:
+                                seq_map[mseq] = mchunk
+                                got_new = True
 
-            # Flush in-order chunks to local socket
-            while next_seq in seq_map:
-                chunk = seq_map.pop(next_seq)
-                try:
-                    local_conn.sendall(chunk)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    local_closed = True
+                    while len(seq_map) > SEQ_MAP_MAX_SIZE:
+                        seq_map.popitem(last=False)
+
+                    while next_seq in seq_map:
+                        cdata = seq_map.pop(next_seq)
+                        try:
+                            local_conn.sendall(cdata)
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            local_closed = True
+                            break
+                        next_seq += 1
+
+                    if got_new or up_len > 0:
+                        idle_rounds = 0
+                        last_activity = time.time()
+                        poll_wait = max(0.02, poll_min_interval)
+                        next_pull_at = time.time() + poll_wait
+                    else:
+                        idle_rounds += 1
+                        if eager_pulls > 0:
+                            eager_pulls -= 1
+                            poll_wait = max(0.02, poll_min_interval)
+                        else:
+                            poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
+                        next_pull_at = time.time() + poll_wait
+
+                if local_closed and idle_rounds >= 3 and not pending:
                     break
-                next_seq += 1
-
-            if got_new or outbound:
-                idle_rounds = 0
-                last_activity = time.time()
-                poll_wait = max(0.02, poll_min_interval)
-                next_pull_at = time.time() + poll_wait
-            else:
-                idle_rounds += 1
-                if eager_pulls > 0:
-                    eager_pulls -= 1
-                    poll_wait = max(0.02, poll_min_interval)
-                else:
-                    poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
-                next_pull_at = time.time() + poll_wait
-
-            if local_closed and idle_rounds >= 3:
-                break
+        finally:
+            for f in pending:
+                f.cancel()
+            pool.shutdown(wait=False)
 
     except TimeoutError as e:
         log.warning("forward timeout %s sid=%s: %s", client_addr, sid, e)
@@ -558,6 +593,7 @@ def run_forward_server(
     poll_min_interval: float,
     poll_max_interval: float,
     idle_timeout: float,
+    pipeline_depth: int = 1,
 ) -> None:
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -609,6 +645,7 @@ def run_forward_server(
                     poll_min_interval,
                     poll_max_interval,
                     idle_timeout,
+                    pipeline_depth,
                 )
             finally:
                 with ip_lock:
@@ -756,6 +793,12 @@ def main() -> None:
         default=25.0,
         help="close forward stream after this many idle seconds; 0 disables",
     )
+    p.add_argument(
+        "--pipeline-depth",
+        type=int,
+        default=2,
+        help="number of concurrent DNS queries per stream (pipelining)",
+    )
     p.add_argument("--resolver-fail-cooldown", type=float, default=20.0)
     p.add_argument("--resolver-health-interval", type=float, default=90.0)
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
@@ -811,6 +854,7 @@ def main() -> None:
             args.forward_poll_min_interval,
             args.forward_poll_max_interval,
             args.forward_idle_timeout,
+            args.pipeline_depth,
         )
     elif args.tcp_test_host:
         run_tcp_test(
