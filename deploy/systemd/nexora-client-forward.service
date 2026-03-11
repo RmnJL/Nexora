@@ -8,7 +8,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/nexora/src
 Environment="NEXORA_CLIENT_PY=/root/nexora/src/nexora_client.py"
-Environment="NEXORA_RESOLVERS=185.49.84.2"
+Environment="NEXORA_RESOLVERS=185.49.84.2,8.8.8.8,1.1.1.1"
 Environment="NEXORA_PORT=53"
 Environment="NEXORA_ZONE=t1.phonexpress.ir"
 Environment="NEXORA_QTYPE=TXT"
