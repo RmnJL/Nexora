@@ -11,7 +11,7 @@ Environment="NEXORA_ZONE=t1.phonexpress.ir"
 Environment="NEXORA_SCANNER_OUTPUT=/etc/nexora/resolvers.json"
 Environment="NEXORA_SCANNER_TIMEOUT=3"
 Environment="NEXORA_SCANNER_CONCURRENCY=10"
-Environment="NEXORA_SCANNER_TOP=5"
+Environment="NEXORA_SCANNER_TOP=10"
 Environment="NEXORA_SCANNER_TIER3_SAMPLE=200"
 Environment="NEXORA_SCANNER_LOOP=14400"
 ExecStart=/usr/bin/python3 -u ${NEXORA_SCANNER_PY} --zone ${NEXORA_ZONE} --output ${NEXORA_SCANNER_OUTPUT} --timeout ${NEXORA_SCANNER_TIMEOUT} --concurrency ${NEXORA_SCANNER_CONCURRENCY} --top ${NEXORA_SCANNER_TOP} --tier3-sample ${NEXORA_SCANNER_TIER3_SAMPLE} --loop ${NEXORA_SCANNER_LOOP}

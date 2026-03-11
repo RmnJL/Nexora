@@ -48,7 +48,7 @@ def chunk_label(s: str, size: int = 44) -> str:
 
 
 class ResolverSelector:
-    def __init__(self, servers: list[str], fail_cooldown: float = 20.0) -> None:
+    def __init__(self, servers: list[str], fail_cooldown: float = 5.0) -> None:
         uniq = []
         for s in servers:
             s = s.strip()
@@ -277,8 +277,7 @@ def _query_txt(
             last_err = e
             selector.report_failure(server)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
-            # Small jitter-like backoff to avoid resolver burst drop.
-            time.sleep(0.08 * (idx + 1))
+            time.sleep(0.03)
     raise TimeoutError(
         f"dns query failed after {attempts} attempts (last resolver {last_server}): {last_err}"
     )
@@ -778,7 +777,7 @@ def main() -> None:
     )
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
-    p.add_argument("--timeout", type=float, default=3.0)
+    p.add_argument("--timeout", type=float, default=2.0)
     p.add_argument("--attempts", type=int, default=3)
     p.add_argument("--qtype", choices=["TXT", "A"], default="TXT")
     p.add_argument("--tcp-test-host", default="")
@@ -829,7 +828,7 @@ def main() -> None:
         "--resolver-file", default="",
         help="path to resolver JSON file (auto-updated by scanner)",
     )
-    p.add_argument("--resolver-fail-cooldown", type=float, default=20.0)
+    p.add_argument("--resolver-fail-cooldown", type=float, default=5)
     p.add_argument("--resolver-health-interval", type=float, default=90.0)
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
     p.add_argument("--resolver-probe-timeout", type=float, default=1.6)
@@ -884,6 +883,10 @@ def main() -> None:
     if args.pipeline_depth <= 0:
         args.pipeline_depth = max(2, len(resolver_list))
         log.info("auto pipeline_depth=%d (from %d resolvers)", args.pipeline_depth, len(resolver_list))
+    # Auto-scale attempts: try at least as many resolvers as available
+    if len(resolver_list) > args.attempts:
+        args.attempts = len(resolver_list)
+        log.info("auto attempts=%d (from %d resolvers)", args.attempts, len(resolver_list))
     probe_qtype = TYPE_A if args.resolver_probe_qtype == "A" else TYPE_TXT
 
     if len(resolver_list) > 1:
