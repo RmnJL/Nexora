@@ -9,7 +9,9 @@ Signature: Rmn JL
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -163,6 +165,28 @@ class ResolverSelector:
 
         t = threading.Thread(target=_loop, daemon=True)
         t.start()
+
+    def update_servers(self, new_servers: list[str]) -> None:
+        """Hot-reload the resolver list without restarting."""
+        uniq = []
+        for s in new_servers:
+            s = s.strip()
+            if s and s not in uniq:
+                uniq.append(s)
+        if not uniq:
+            return
+        with self._lock:
+            old = set(self._servers)
+            self._servers = uniq
+            for s in uniq:
+                if s not in old:
+                    self._fails[s] = 0
+                    self._bad_until[s] = 0.0
+                    self._order[s] = len(self._order)
+            if self._active not in uniq:
+                self._active = uniq[0]
+            self._rr_idx = 0
+        log.info("resolver list updated: %s", ",".join(uniq))
 
     @property
     def servers(self) -> list[str]:
@@ -799,6 +823,10 @@ def main() -> None:
         default=2,
         help="number of concurrent DNS queries per stream (pipelining)",
     )
+    p.add_argument(
+        "--resolver-file", default="",
+        help="path to resolver JSON file (auto-updated by scanner)",
+    )
     p.add_argument("--resolver-fail-cooldown", type=float, default=20.0)
     p.add_argument("--resolver-health-interval", type=float, default=90.0)
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
@@ -807,7 +835,47 @@ def main() -> None:
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     resolver_list = [x.strip() for x in args.server.split(",") if x.strip()]
+
+    # Try loading from resolver file (scanner output) first
+    if args.resolver_file and os.path.isfile(args.resolver_file):
+        try:
+            with open(args.resolver_file, "r") as f:
+                data = json.load(f)
+            file_resolvers = data.get("resolver_list", [])
+            if file_resolvers:
+                log.info("loaded %d resolvers from %s", len(file_resolvers), args.resolver_file)
+                resolver_list = file_resolvers
+        except Exception as e:
+            log.warning("failed to read resolver file %s: %s", args.resolver_file, e)
+
     selector = ResolverSelector(resolver_list, fail_cooldown=args.resolver_fail_cooldown)
+
+    # Background watcher: reload resolvers when scanner updates the file
+    if args.resolver_file:
+        def _watch_resolver_file(path: str, sel: ResolverSelector) -> None:
+            last_mtime = 0.0
+            while True:
+                time.sleep(30)
+                try:
+                    mtime = os.path.getmtime(path)
+                    if mtime <= last_mtime:
+                        continue
+                    last_mtime = mtime
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                    new_list = data.get("resolver_list", [])
+                    if new_list and new_list != sel.servers:
+                        sel.update_servers(new_list)
+                except Exception:
+                    pass
+
+        wt = threading.Thread(
+            target=_watch_resolver_file,
+            args=(args.resolver_file, selector),
+            daemon=True,
+        )
+        wt.start()
+        log.info("resolver file watcher started: %s", args.resolver_file)
     global _dns_pacer
     _dns_pacer = _DnsQueryPacer(min_interval=args.dns_query_interval)
     probe_qtype = TYPE_A if args.resolver_probe_qtype == "A" else TYPE_TXT

@@ -71,6 +71,7 @@ sudo journalctl -u nexora-server -f
 
 Copy unit file and create env override:
 
+
 ```bash
 sudo cp /root/nexora/deploy/systemd/nexora-client-forward.service /etc/systemd/system/
 sudo tee /etc/default/nexora-client-forward >/dev/null <<'EOF'

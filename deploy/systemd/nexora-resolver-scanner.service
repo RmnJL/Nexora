@@ -1,0 +1,23 @@
+[Unit]
+Description=Nexora Resolver Scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment="NEXORA_SCANNER_PY=/root/nexora/src/resolver_scanner.py"
+Environment="NEXORA_ZONE=t1.phonexpress.ir"
+Environment="NEXORA_SCANNER_OUTPUT=/etc/nexora/resolvers.json"
+Environment="NEXORA_SCANNER_TIMEOUT=3"
+Environment="NEXORA_SCANNER_CONCURRENCY=10"
+Environment="NEXORA_SCANNER_TOP=5"
+Environment="NEXORA_SCANNER_TIER3_SAMPLE=200"
+Environment="NEXORA_SCANNER_LOOP=14400"
+ExecStart=/usr/bin/python3 -u ${NEXORA_SCANNER_PY} --zone ${NEXORA_ZONE} --output ${NEXORA_SCANNER_OUTPUT} --timeout ${NEXORA_SCANNER_TIMEOUT} --concurrency ${NEXORA_SCANNER_CONCURRENCY} --top ${NEXORA_SCANNER_TOP} --tier3-sample ${NEXORA_SCANNER_TIER3_SAMPLE} --loop ${NEXORA_SCANNER_LOOP}
+Restart=always
+RestartSec=30
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
