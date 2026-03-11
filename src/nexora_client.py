@@ -41,7 +41,7 @@ log = logging.getLogger("nexora-client")
 SEQ_MAP_MAX_SIZE = 512
 
 
-def chunk_label(s: str, size: int = 63) -> str:
+def chunk_label(s: str, size: int = 44) -> str:
     return ".".join(s[i : i + size] for i in range(0, len(s), size))
 
 
@@ -761,7 +761,7 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
-    p.add_argument("--tcp-chunk-size", type=int, default=12)
+    p.add_argument("--tcp-chunk-size", type=int, default=80)
     p.add_argument("--forward-listen-host", default="")
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
