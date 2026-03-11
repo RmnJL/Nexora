@@ -575,7 +575,7 @@ def run_forward_server(
         conn, addr = lsock.accept()
         peer_ip = addr[0]
 
-        if not sem.acquire(blocking=False):
+        if not sem.acquire(timeout=2.0):
             log.warning("forward reject local=%s:%d reason=max_conns", peer_ip, addr[1])
             try:
                 conn.close()
@@ -715,7 +715,7 @@ def main() -> None:
     )
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
-    p.add_argument("--timeout", type=float, default=5.0)
+    p.add_argument("--timeout", type=float, default=3.0)
     p.add_argument("--attempts", type=int, default=2)
     p.add_argument("--qtype", choices=["TXT", "A"], default="TXT")
     p.add_argument("--tcp-test-host", default="")
@@ -729,13 +729,13 @@ def main() -> None:
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
     p.add_argument("--forward-target-port", type=int, default=0)
-    p.add_argument("--forward-max-conns", type=int, default=16)
+    p.add_argument("--forward-max-conns", type=int, default=4)
     p.add_argument("--forward-max-conns-per-ip", type=int, default=64)
     p.add_argument("--stream-open-retries", type=int, default=2)
     p.add_argument(
         "--dns-query-interval",
         type=float,
-        default=0.15,
+        default=0.05,
         help="minimum seconds between DNS queries (global rate limit)",
     )
     p.add_argument(

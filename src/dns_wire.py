@@ -129,7 +129,7 @@ def parse_answer_data(packet: bytes, expected_qid: int) -> str:
 
 def build_servfail(request: bytes) -> bytes:
     qid = request[:2]
-    flags = struct.pack(">H", 0x8002)
+    flags = struct.pack(">H", 0x8502)
     counts = struct.pack(">HHHH", 1, 0, 0, 0)
     # copy question section
     _, off = _decode_name(request, 12)
@@ -139,7 +139,7 @@ def build_servfail(request: bytes) -> bytes:
 
 def build_txt_answer(request: bytes, txt_data: str, ttl: int = 0) -> bytes:
     qid = request[:2]
-    flags = struct.pack(">H", 0x8180)
+    flags = struct.pack(">H", 0x8500)
     counts = struct.pack(">HHHH", 1, 1, 0, 0)
     qname, off = _decode_name(request, 12)
     qsec = request[12 : off + 4]
@@ -151,7 +151,7 @@ def build_txt_answer(request: bytes, txt_data: str, ttl: int = 0) -> bytes:
 
 def build_cname_answer(request: bytes, cname_target: str, ttl: int = 0) -> bytes:
     qid = request[:2]
-    flags = struct.pack(">H", 0x8180)
+    flags = struct.pack(">H", 0x8500)
     counts = struct.pack(">HHHH", 1, 1, 0, 0)
     _qname, off = _decode_name(request, 12)
     qsec = request[12 : off + 4]
