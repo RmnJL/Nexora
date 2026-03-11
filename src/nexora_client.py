@@ -482,6 +482,7 @@ def _handle_forward_conn(
         next_pull_at = time.time()
         ever_received_data = False
         data_in_flight = False  # ensure only 1 data query in flight (ordering)
+        session_start = time.time()
 
         pool = ThreadPoolExecutor(max_workers=max(1, pipeline_depth))
         pending = {}  # {future: (nonce, up_len)}
@@ -490,9 +491,9 @@ def _handle_forward_conn(
                 now = time.time()
                 if idle_timeout > 0 and now - last_activity >= idle_timeout:
                     break
-                # Kill zombie sessions: no downstream data 5 s after last upstream send
-                if not ever_received_data and now - last_activity >= 5.0:
-                    log.info("forward zombie sid=%d: no downstream data", sid)
+                # Kill zombie sessions: no downstream data 4s after session start
+                if not ever_received_data and now - session_start >= 4.0:
+                    log.info("forward zombie sid=%d: no downstream after %.1fs", sid, now - session_start)
                     break
 
                 # --- Fill pipeline with new queries ---
@@ -527,8 +528,11 @@ def _handle_forward_conn(
                     pending[fut] = (nonce, len(outbound))
                     if outbound:
                         data_in_flight = True
-                    next_pull_at = now2 + poll_wait
-                    if not outbound:
+                        # Don't advance next_pull_at here: let companion poll
+                        # fire in the next fill-loop iteration so pipeline_depth
+                        # slots are actually used for downstream retrieval.
+                    else:
+                        next_pull_at = now2 + poll_wait
                         break  # at most one empty poll per fill cycle
 
                 # --- Wait for results ---
