@@ -48,9 +48,9 @@ log = logging.getLogger("nexora-server")
 # Single-threaded server: balance between catching backend responses
 # and not stalling the DNS loop.  With query pacer on the client side
 # limiting to ~7 qps, 0.1 s per recv is acceptable.
-STREAM_SOCK_TIMEOUT = 0.1
+STREAM_SOCK_TIMEOUT = 0.3
 STREAM_RECV_SLICE = 4096
-STREAM_RECV_ROUNDS = 2
+STREAM_RECV_ROUNDS = 3
 STREAM_RECV_MAX_BYTES = 8192
 # Downstream chunk MUST stay small enough so the base32-encoded response
 # fits in a DNS answer.  TXT: max 254 base32 chars -> 158 raw -> 143 payload.
@@ -427,8 +427,13 @@ def run_server(
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload
                     )
-                except Exception:
-                    log.warning("stream send error session=%d", packet.session_id, exc_info=True)
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    log.warning("stream send error session=%d: %s", packet.session_id, e)
+                    try:
+                        st.close()
+                    except Exception:
+                        pass
+                    sess["stream_sock"] = None
                     ack = pack_packet(
                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
                     )
