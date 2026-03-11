@@ -43,23 +43,24 @@ Client options:
   --port PORT                default: 53
   --zone DOMAIN              default: t1.phonexpress.ir
   --qtype TXT|A              default: TXT
-  --timeout SECONDS          default: 3
-  --attempts N               default: 3
+  --timeout SECONDS          default: 5
+  --attempts N               default: 2
   --resolver-fail-cooldown   default: 20
   --resolver-health-interval default: 120
   --resolver-switch-interval default: 300
   --resolver-probe-timeout   default: 1.6
   --resolver-probe-qtype     default: TXT
-  --tcp-chunk-size N         default: 50
+  --tcp-chunk-size N         default: 24
   --listen-host IP           default: 0.0.0.0
   --listen-port PORT         default: 1443
   --target-host IP           default: 127.0.0.1
   --target-port PORT         default: 8443
-  --max-conns N              default: 2
+  --max-conns N              default: 16
   --max-conns-per-ip N       default: 64
   --stream-open-retries N    default: 2
-  --poll-min-interval SEC    default: 0.1
-  --poll-max-interval SEC    default: 1.0
+  --dns-query-interval SEC   default: 0.15
+  --poll-min-interval SEC    default: 0.2
+  --poll-max-interval SEC    default: 3.0
   --idle-timeout SEC         default: 25
 EOF
 }
@@ -123,23 +124,24 @@ install_client() {
   local port="53"
   local zone="t1.phonexpress.ir"
   local qtype="TXT"
-  local timeout="3"
-  local attempts="3"
+  local timeout="5"
+  local attempts="2"
   local resolver_fail_cooldown="20"
   local resolver_health_interval="120"
   local resolver_switch_interval="300"
   local resolver_probe_timeout="1.6"
   local resolver_probe_qtype="TXT"
-  local tcp_chunk_size="50"
+  local tcp_chunk_size="24"
   local listen_host="0.0.0.0"
   local listen_port="1443"
   local target_host="127.0.0.1"
   local target_port="8443"
-  local max_conns="2"
+  local max_conns="16"
   local max_conns_per_ip="64"
   local stream_open_retries="2"
-  local poll_min_interval="0.1"
-  local poll_max_interval="1.0"
+  local dns_query_interval="0.15"
+  local poll_min_interval="0.2"
+  local poll_max_interval="3.0"
   local idle_timeout="25"
   local client_py="/root/nexora/src/nexora_client.py"
 
@@ -164,6 +166,7 @@ install_client() {
       --max-conns) max_conns="${2:?}"; shift 2 ;;
       --max-conns-per-ip) max_conns_per_ip="${2:?}"; shift 2 ;;
       --stream-open-retries) stream_open_retries="${2:?}"; shift 2 ;;
+      --dns-query-interval) dns_query_interval="${2:?}"; shift 2 ;;
       --poll-min-interval) poll_min_interval="${2:?}"; shift 2 ;;
       --poll-max-interval) poll_max_interval="${2:?}"; shift 2 ;;
       --idle-timeout) idle_timeout="${2:?}"; shift 2 ;;
@@ -199,6 +202,7 @@ NEXORA_FORWARD_TARGET_PORT=${target_port}
 NEXORA_FORWARD_MAX_CONNS=${max_conns}
 NEXORA_FORWARD_MAX_CONNS_PER_IP=${max_conns_per_ip}
 NEXORA_STREAM_OPEN_RETRIES=${stream_open_retries}
+NEXORA_DNS_QUERY_INTERVAL=${dns_query_interval}
 NEXORA_FORWARD_POLL_MIN_INTERVAL=${poll_min_interval}
 NEXORA_FORWARD_POLL_MAX_INTERVAL=${poll_max_interval}
 NEXORA_FORWARD_IDLE_TIMEOUT=${idle_timeout}

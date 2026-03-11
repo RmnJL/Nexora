@@ -41,17 +41,16 @@ from nexora_proto import (
 
 log = logging.getLogger("nexora-server")
 
-# Keep this short — the server is single-threaded and blocks on
-# every recv().  0.05 s is enough to catch immediate backend responses
-# without stalling the DNS loop too long.
-STREAM_SOCK_TIMEOUT = 0.05
+# Single-threaded server: balance between catching backend responses
+# and not stalling the DNS loop.  With query pacer on the client side
+# limiting to ~7 qps, 0.1 s per recv is acceptable.
+STREAM_SOCK_TIMEOUT = 0.1
 STREAM_RECV_SLICE = 4096
-STREAM_RECV_ROUNDS = 3
+STREAM_RECV_ROUNDS = 2
 STREAM_RECV_MAX_BYTES = 8192
 # Downstream chunk MUST stay small enough so the base32-encoded response
-# fits in a DNS CNAME name (max 255 wire bytes).  With label size 50 and
-# ".x." suffix the safe ceiling is ~220 base32 chars → 137 raw bytes.
-# 137 - 15 header = 122 payload.  We use 120 payload / 100-byte chunks.
+# fits in a DNS answer.  TXT: max 254 base32 chars -> 158 raw -> 143 payload.
+# CNAME: max ~220 base32 chars -> 137 raw -> 122 payload.
 DOWNSTREAM_CHUNK_SIZE = 100
 
 # Rate limiting: max HELLO requests per source IP within window.
@@ -399,9 +398,9 @@ def run_server(
                     _enqueue_downstream(sess, recv_data, chunk_size=DOWNSTREAM_CHUNK_SIZE)
                     q = sess.get("down_q", deque())
                     # Pack as many queued chunks as fit in one DNS response.
-                    # For CNAME safety: max ~220 base32 chars → 137 raw → 122 payload.
-                    # Use 120 as safe ceiling.
-                    max_payload = 120
+                    # TXT: 254 base32 chars -> 158 raw -> 143 payload, use 140.
+                    # CNAME: ~220 base32 chars -> 137 raw -> 122 payload, use 120.
+                    max_payload = 140 if qtype == TYPE_TXT else 120
                     out_payload = b""
                     while q:
                         seq, out_chunk = q[0]

@@ -40,7 +40,7 @@ log = logging.getLogger("nexora-client")
 SEQ_MAP_MAX_SIZE = 512
 
 
-def chunk_label(s: str, size: int = 50) -> str:
+def chunk_label(s: str, size: int = 63) -> str:
     return ".".join(s[i : i + size] for i in range(0, len(s), size))
 
 
@@ -63,6 +63,7 @@ class ResolverSelector:
         self._fails: dict[str, int] = {s: 0 for s in uniq}
         self._bad_until: dict[str, float] = {s: 0.0 for s in uniq}
         self._order: dict[str, int] = {s: i for i, s in enumerate(uniq)}
+        self._rr_idx = 0
 
     def _preferred_server_locked(self, now: float) -> str:
         good = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
@@ -86,6 +87,17 @@ class ResolverSelector:
             if active_bad or pref_fails + 1 < active_fails:
                 self._active = preferred
             return self._active
+
+    def choose_next(self) -> str:
+        """Round-robin across healthy resolvers to distribute load."""
+        now = time.time()
+        with self._lock:
+            pool = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
+            if not pool:
+                pool = list(self._servers)
+            server = pool[self._rr_idx % len(pool)]
+            self._rr_idx += 1
+            return server
 
     def report_success(self, server: str) -> None:
         with self._lock:
@@ -161,6 +173,33 @@ class ResolverSelector:
             return self._active
 
 
+class _DnsQueryPacer:
+    """Enforce minimum interval between DNS queries across all threads.
+
+    Prevents flooding resolvers which triggers anti-tunnel detection.
+    """
+
+    def __init__(self, min_interval: float = 0.15) -> None:
+        self._lock = Lock()
+        self._next_send = 0.0
+        self._interval = min_interval
+
+    def pace(self) -> None:
+        with self._lock:
+            now = time.time()
+            if now < self._next_send:
+                wait = self._next_send - now
+                self._next_send += self._interval
+            else:
+                wait = 0.0
+                self._next_send = now + self._interval
+        if wait > 0:
+            time.sleep(wait)
+
+
+_dns_pacer: _DnsQueryPacer | None = None
+
+
 def _query_pkt_direct(
     server: str,
     port: int,
@@ -172,6 +211,8 @@ def _query_pkt_direct(
     encoded = encode_dns_data(payload)
     fqdn = f"{chunk_label(encoded)}.{zone.strip('.')}"
     qid, query = build_query(fqdn, qtype=qtype)
+    if _dns_pacer is not None:
+        _dns_pacer.pace()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
@@ -199,7 +240,7 @@ def _query_txt(
     last_err = None
     last_server = ""
     for idx in range(max(1, attempts)):
-        server = selector.choose()
+        server = selector.choose_next()
         last_server = server
         try:
             qid, pkt = _query_pkt_direct(server, port, zone, timeout, payload, qtype)
@@ -418,7 +459,7 @@ def _handle_forward_conn(
                     elif outbound:
                         # After local upstream bytes, keep a few fast pulls
                         # to capture delayed downstream handshake responses.
-                        eager_pulls = max(eager_pulls, 12)
+                        eager_pulls = max(eager_pulls, 4)
                 except socket.timeout:
                     outbound = b""
 
@@ -674,8 +715,8 @@ def main() -> None:
     )
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
-    p.add_argument("--timeout", type=float, default=2.0)
-    p.add_argument("--attempts", type=int, default=3)
+    p.add_argument("--timeout", type=float, default=5.0)
+    p.add_argument("--attempts", type=int, default=2)
     p.add_argument("--qtype", choices=["TXT", "A"], default="TXT")
     p.add_argument("--tcp-test-host", default="")
     p.add_argument("--tcp-test-port", type=int, default=80)
@@ -683,24 +724,30 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
-    p.add_argument("--tcp-chunk-size", type=int, default=50)
+    p.add_argument("--tcp-chunk-size", type=int, default=24)
     p.add_argument("--forward-listen-host", default="")
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
     p.add_argument("--forward-target-port", type=int, default=0)
-    p.add_argument("--forward-max-conns", type=int, default=2)
+    p.add_argument("--forward-max-conns", type=int, default=16)
     p.add_argument("--forward-max-conns-per-ip", type=int, default=64)
     p.add_argument("--stream-open-retries", type=int, default=2)
     p.add_argument(
+        "--dns-query-interval",
+        type=float,
+        default=0.15,
+        help="minimum seconds between DNS queries (global rate limit)",
+    )
+    p.add_argument(
         "--forward-poll-min-interval",
         type=float,
-        default=0.05,
+        default=0.2,
         help="minimum delay between empty downstream polls (seconds)",
     )
     p.add_argument(
         "--forward-poll-max-interval",
         type=float,
-        default=0.8,
+        default=3.0,
         help="maximum delay between empty downstream polls under idle pressure (seconds)",
     )
     p.add_argument(
@@ -713,11 +760,13 @@ def main() -> None:
     p.add_argument("--resolver-health-interval", type=float, default=90.0)
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
     p.add_argument("--resolver-probe-timeout", type=float, default=1.6)
-    p.add_argument("--resolver-probe-qtype", choices=["TXT", "A"], default="A")
+    p.add_argument("--resolver-probe-qtype", choices=["TXT", "A"], default="TXT")
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     resolver_list = [x.strip() for x in args.server.split(",") if x.strip()]
     selector = ResolverSelector(resolver_list, fail_cooldown=args.resolver_fail_cooldown)
+    global _dns_pacer
+    _dns_pacer = _DnsQueryPacer(min_interval=args.dns_query_interval)
     probe_qtype = TYPE_A if args.resolver_probe_qtype == "A" else TYPE_TXT
 
     if len(resolver_list) > 1:
