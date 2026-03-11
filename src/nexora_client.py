@@ -435,6 +435,15 @@ def _handle_forward_conn(
     sid = None
     try:
         local_conn.settimeout(0.05)
+        # Enable TCP keepalive to detect dead peers quickly (unclean disconnect)
+        local_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        try:
+            # Linux: start keepalive after 5s idle, probe every 3s, fail after 3 probes (~14s)
+            local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+            local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+            local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except (AttributeError, OSError):
+            pass  # not available on all platforms
         # Create a fresh session and retry stream-open a few times.
         for _ in range(max(1, stream_open_retries)):
             sid = _establish_session(selector, port, zone, timeout, attempts, qtype)
@@ -488,10 +497,15 @@ def _handle_forward_conn(
                             outbound = local_conn.recv(chunk_size)
                             if outbound == b"":
                                 local_closed = True
+                                log.info("forward local closed sid=%d (clean FIN)", sid)
                             elif outbound:
                                 eager_pulls = max(eager_pulls, 4)
                         except socket.timeout:
                             outbound = b""
+                        except (ConnectionResetError, BrokenPipeError, OSError):
+                            local_closed = True
+                            outbound = b""
+                            log.info("forward local closed sid=%d (connection reset)", sid)
 
                     now2 = time.time()
                     should_send = bool(outbound) or now2 >= next_pull_at
@@ -576,12 +590,16 @@ def _handle_forward_conn(
                             poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
                         next_pull_at = time.time() + poll_wait
 
-                if local_closed and idle_rounds >= 3 and not pending:
+                if local_closed and idle_rounds >= 1 and not pending:
                     break
         finally:
             for f in pending:
                 f.cancel()
             pool.shutdown(wait=False)
+            if local_closed:
+                log.info("forward done %s sid=%s (local closed, idle_rounds=%d)", client_addr, sid, idle_rounds)
+            else:
+                log.info("forward done %s sid=%s (idle timeout)", client_addr, sid)
 
     except TimeoutError as e:
         log.warning("forward timeout %s sid=%s: %s", client_addr, sid, e)
@@ -815,7 +833,7 @@ def main() -> None:
     p.add_argument(
         "--forward-idle-timeout",
         type=float,
-        default=25.0,
+        default=15.0,
         help="close forward stream after this many idle seconds; 0 disables",
     )
     p.add_argument(
