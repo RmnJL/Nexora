@@ -761,7 +761,7 @@ def main() -> None:
         "--tcp-test-request",
         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
-    p.add_argument("--tcp-chunk-size", type=int, default=80)
+    p.add_argument("--tcp-chunk-size", type=int, default=35)
     p.add_argument("--forward-listen-host", default="")
     p.add_argument("--forward-listen-port", type=int, default=0)
     p.add_argument("--forward-target-host", default="")
