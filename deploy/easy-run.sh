@@ -48,7 +48,7 @@ Client options:
   --attempts N               default: 4
   --resolver-attempt-cap N   default: 6
   --resolver-fail-cooldown   default: 5
-  --resolver-max-inflight N  default: 2
+  --resolver-max-inflight N  default: 1
   --resolver-health-interval default: 90
   --resolver-switch-interval default: 180
   --resolver-probe-timeout   default: 1.4
@@ -134,7 +134,7 @@ install_client() {
   local attempts="4"
   local resolver_attempt_cap="6"
   local resolver_fail_cooldown="5"
-  local resolver_max_inflight="2"
+  local resolver_max_inflight="1"
   local resolver_health_interval="90"
   local resolver_switch_interval="180"
   local resolver_probe_timeout="1.4"
