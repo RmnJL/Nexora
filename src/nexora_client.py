@@ -117,6 +117,18 @@ class ResolverSelector:
             if server == self._active:
                 self._active = self._preferred_server_locked(now)
 
+    def report_nxdomain(self, server: str) -> None:
+        """NXDOMAIN = resolver can't resolve our zone. Long blacklist."""
+        now = time.time()
+        with self._lock:
+            was_new = self._fails.get(server, 0) < 100
+            self._fails[server] = 100
+            self._bad_until[server] = now + 300.0
+            if server == self._active:
+                self._active = self._preferred_server_locked(now)
+        if was_new:
+            log.info("resolver NXDOMAIN blacklist %s for 300s", server)
+
     def rotate_active(self) -> str:
         now = time.time()
         with self._lock:
@@ -275,7 +287,10 @@ def _query_txt(
             return qid, pkt
         except Exception as e:
             last_err = e
-            selector.report_failure(server)
+            if "NXDOMAIN" in str(e):
+                selector.report_nxdomain(server)
+            else:
+                selector.report_failure(server)
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
             time.sleep(0.03 if idx < 3 else 0.5)
     raise TimeoutError(
