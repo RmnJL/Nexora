@@ -11,7 +11,7 @@ Environment="NEXORA_ZONE=t1.phonexpress.ir"
 Environment="NEXORA_SCANNER_OUTPUT=/etc/nexora/resolvers.json"
 Environment="NEXORA_SCANNER_TIMEOUT=2.5"
 Environment="NEXORA_SCANNER_CONCURRENCY=24"
-Environment="NEXORA_SCANNER_TOP=12"
+Environment="NEXORA_SCANNER_TOP=8"
 Environment="NEXORA_SCANNER_TIER3_SAMPLE=0"
 Environment="NEXORA_SCANNER_LOOP=180"
 Environment="NEXORA_SCANNER_ACTIVE_POOL=18"
@@ -22,9 +22,12 @@ Environment="NEXORA_SCANNER_COLD_INTERVAL=2400"
 Environment="NEXORA_SCANNER_MAX_INFLIGHT=1"
 Environment="NEXORA_SCANNER_ROLLBACK_TTL=1800"
 Environment="NEXORA_SCANNER_ALERT_MIN_ACTIVE=5"
+Environment="NEXORA_SCANNER_PUBLISH_MIN_PROBES=3"
+Environment="NEXORA_SCANNER_PUBLISH_MIN_PASS_RATE=0.45"
+Environment="NEXORA_SCANNER_PUBLISH_MAX_LATENCY_MS=900"
 # Optional overrides written by ops script/manual tuning.
 EnvironmentFile=-/etc/default/nexora-resolver-scanner
-ExecStart=/usr/bin/python3 -u ${NEXORA_SCANNER_PY} --zone ${NEXORA_ZONE} --output ${NEXORA_SCANNER_OUTPUT} --timeout ${NEXORA_SCANNER_TIMEOUT} --concurrency ${NEXORA_SCANNER_CONCURRENCY} --top ${NEXORA_SCANNER_TOP} --tier3-sample ${NEXORA_SCANNER_TIER3_SAMPLE} --loop ${NEXORA_SCANNER_LOOP} --active-pool-size ${NEXORA_SCANNER_ACTIVE_POOL} --standby-pool-size ${NEXORA_SCANNER_STANDBY_POOL} --hot-probe-interval ${NEXORA_SCANNER_HOT_INTERVAL} --standby-probe-interval ${NEXORA_SCANNER_STANDBY_INTERVAL} --cold-probe-interval ${NEXORA_SCANNER_COLD_INTERVAL} --max-inflight-per-resolver ${NEXORA_SCANNER_MAX_INFLIGHT} --rollback-ttl ${NEXORA_SCANNER_ROLLBACK_TTL} --alert-min-active ${NEXORA_SCANNER_ALERT_MIN_ACTIVE}
+ExecStart=/usr/bin/python3 -u ${NEXORA_SCANNER_PY} --zone ${NEXORA_ZONE} --output ${NEXORA_SCANNER_OUTPUT} --timeout ${NEXORA_SCANNER_TIMEOUT} --concurrency ${NEXORA_SCANNER_CONCURRENCY} --top ${NEXORA_SCANNER_TOP} --tier3-sample ${NEXORA_SCANNER_TIER3_SAMPLE} --loop ${NEXORA_SCANNER_LOOP} --active-pool-size ${NEXORA_SCANNER_ACTIVE_POOL} --standby-pool-size ${NEXORA_SCANNER_STANDBY_POOL} --hot-probe-interval ${NEXORA_SCANNER_HOT_INTERVAL} --standby-probe-interval ${NEXORA_SCANNER_STANDBY_INTERVAL} --cold-probe-interval ${NEXORA_SCANNER_COLD_INTERVAL} --max-inflight-per-resolver ${NEXORA_SCANNER_MAX_INFLIGHT} --rollback-ttl ${NEXORA_SCANNER_ROLLBACK_TTL} --alert-min-active ${NEXORA_SCANNER_ALERT_MIN_ACTIVE} --publish-min-probes ${NEXORA_SCANNER_PUBLISH_MIN_PROBES} --publish-min-pass-rate ${NEXORA_SCANNER_PUBLISH_MIN_PASS_RATE} --publish-max-latency-ms ${NEXORA_SCANNER_PUBLISH_MAX_LATENCY_MS}
 Restart=always
 RestartSec=30
 LimitNOFILE=4096

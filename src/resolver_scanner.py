@@ -527,6 +527,9 @@ _CB_FAIL_THRESHOLD = 3
 _CB_BASE_COOLDOWN_SEC = 120.0
 _CB_MAX_COOLDOWN_SEC = 1800.0
 _HYSTERESIS_SCORE_DELTA = 0.35
+_PUBLISH_MIN_PROBES = 3
+_PUBLISH_MIN_PASS_RATE = 0.45
+_PUBLISH_MAX_LATENCY_MS = 900.0
 
 
 @dataclass
@@ -745,8 +748,9 @@ def _build_continuous_report(
     generation: int,
     top_n: int,
     stale_after_sec: float = 1800.0,
-    min_probes: int = 2,
-    min_success_rate: float = 0.15,
+    min_probes: int = _PUBLISH_MIN_PROBES,
+    min_success_rate: float = _PUBLISH_MIN_PASS_RATE,
+    max_latency_ms: float = _PUBLISH_MAX_LATENCY_MS,
 ) -> ScanReport:
     now_ts = time.time()
     ranked_rows: list[tuple[float, dict[str, object]]] = []
@@ -763,6 +767,8 @@ def _build_continuous_report(
 
         success_rate = _runtime_pass_rate(st)
         if success_rate < min_success_rate:
+            continue
+        if max_latency_ms > 0 and st.ewma_latency_ms > max_latency_ms:
             continue
 
         quality = _runtime_quality_score(st, now_ts)
@@ -796,8 +802,17 @@ def _build_continuous_report(
     # Soft fallback: if strict filter is empty, publish last successful rows.
     if not top_rows:
         soft_rows: list[tuple[float, dict[str, object]]] = []
+        soft_latency_cap = (
+            max(1200.0, max_latency_ms * 1.5) if max_latency_ms > 0 else 1400.0
+        )
+        soft_min_pass_rate = max(0.25, min_success_rate * 0.6)
         for st in stats_snapshot:
             if st.last_pass_result is None or st.resolver in quarantine_pool:
+                continue
+            success_rate = _runtime_pass_rate(st)
+            if success_rate < soft_min_pass_rate:
+                continue
+            if st.ewma_latency_ms > soft_latency_cap:
                 continue
             quality = _runtime_quality_score(st, now_ts)
             row = asdict(st.last_pass_result)
@@ -805,7 +820,7 @@ def _build_continuous_report(
             row["latency_ms"] = round(st.ewma_latency_ms, 1)
             row["runtime_quality"] = round(quality, 3)
             row["runtime_probes"] = st.probes
-            row["runtime_pass_rate"] = round(_runtime_pass_rate(st), 3)
+            row["runtime_pass_rate"] = round(success_rate, 3)
             row["runtime_consecutive_failures"] = st.consecutive_failures
             row["runtime_last_probe_ts"] = int(st.last_probe_ts)
             row["pool"] = "fallback"
@@ -970,6 +985,9 @@ def run_continuous_scan(
     max_inflight_per_resolver: int = 1,
     rollback_ttl_sec: float = 1800.0,
     alert_min_active: int = 6,
+    publish_min_probes: int = _PUBLISH_MIN_PROBES,
+    publish_min_pass_rate: float = _PUBLISH_MIN_PASS_RATE,
+    publish_max_latency_ms: float = _PUBLISH_MAX_LATENCY_MS,
 ) -> None:
     candidates = load_resolvers(resolver_file, tier3_sample=tier3_sample)
     if not candidates:
@@ -1207,6 +1225,9 @@ def run_continuous_scan(
                     quarantine_pool=quarantine_pool,
                     generation=generation,
                     top_n=top_n,
+                    min_probes=publish_min_probes,
+                    min_success_rate=publish_min_pass_rate,
+                    max_latency_ms=publish_max_latency_ms,
                 )
                 report.resolvers = _apply_publish_hysteresis(
                     report.resolvers,
@@ -1397,6 +1418,18 @@ def main() -> None:
         "--alert-min-active", type=int, default=6,
         help="alert threshold for active pool size (default: 6)",
     )
+    p.add_argument(
+        "--publish-min-probes", type=int, default=_PUBLISH_MIN_PROBES,
+        help="minimum probes before resolver is publish-eligible (default: 3)",
+    )
+    p.add_argument(
+        "--publish-min-pass-rate", type=float, default=_PUBLISH_MIN_PASS_RATE,
+        help="minimum pass rate [0..1] for publish-eligible resolvers (default: 0.45)",
+    )
+    p.add_argument(
+        "--publish-max-latency-ms", type=float, default=_PUBLISH_MAX_LATENCY_MS,
+        help="maximum EWMA latency in ms for publish-eligible resolvers (default: 900)",
+    )
     args = p.parse_args()
 
     if args.loop > 0:
@@ -1422,6 +1455,9 @@ def main() -> None:
             max_inflight_per_resolver=args.max_inflight_per_resolver,
             rollback_ttl_sec=args.rollback_ttl,
             alert_min_active=args.alert_min_active,
+            publish_min_probes=args.publish_min_probes,
+            publish_min_pass_rate=args.publish_min_pass_rate,
+            publish_max_latency_ms=args.publish_max_latency_ms,
         )
     else:
         report = run_scan(
