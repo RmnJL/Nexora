@@ -9,6 +9,7 @@ Signature: Rmn JL
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -47,8 +48,36 @@ def chunk_label(s: str, size: int = 44) -> str:
     return ".".join(s[i : i + size] for i in range(0, len(s), size))
 
 
+def _is_public_ipv4(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+        return addr.version == 4 and addr.is_global
+    except ValueError:
+        return False
+
+
+def _sanitize_resolvers(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        ip = str(raw).strip()
+        if not ip or ip in seen:
+            continue
+        if not _is_public_ipv4(ip):
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
+
+
 class ResolverSelector:
-    def __init__(self, servers: list[str], fail_cooldown: float = 5.0) -> None:
+    def __init__(
+        self,
+        servers: list[str],
+        fail_cooldown: float = 5.0,
+        max_inflight_per_resolver: int = 2,
+        ewma_alpha: float = 0.2,
+    ) -> None:
         uniq = []
         for s in servers:
             s = s.strip()
@@ -66,8 +95,12 @@ class ResolverSelector:
         self._fails: dict[str, int] = {s: 0 for s in uniq}
         self._bad_until: dict[str, float] = {s: 0.0 for s in uniq}
         self._order: dict[str, int] = {s: i for i, s in enumerate(uniq)}
-        self._rr_idx = 0
         self._timeout_streak: dict[str, int] = {s: 0 for s in uniq}
+        self._max_inflight_per_resolver = max(1, max_inflight_per_resolver)
+        self._ewma_alpha = min(0.8, max(0.05, ewma_alpha))
+        self._inflight: dict[str, int] = {s: 0 for s in uniq}
+        self._success_ewma: dict[str, float] = {s: 0.5 for s in uniq}
+        self._latency_ewma_ms: dict[str, float] = {s: 700.0 for s in uniq}
 
     def _preferred_server_locked(self, now: float) -> str:
         good = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
@@ -93,46 +126,89 @@ class ResolverSelector:
             return self._active
 
     def choose_next(self, exclude: set | None = None) -> str | None:
-        """Round-robin across healthy resolvers to distribute load.
-
-        *exclude* — servers to skip (e.g. NXDOMAIN in this call).
-        Returns ``None`` when every server is excluded.
-        """
+        """Weighted power-of-two choices across healthy resolvers."""
         now = time.time()
         with self._lock:
             pool = [
-                s for s in self._servers
+                s
+                for s in self._servers
                 if now >= self._bad_until.get(s, 0.0)
+                and self._inflight.get(s, 0) < self._max_inflight_per_resolver
                 and (not exclude or s not in exclude)
             ]
             if not pool:
-                # Try non-excluded but still blacklisted
                 pool = [
-                    s for s in self._servers
-                    if not exclude or s not in exclude
+                    s
+                    for s in self._servers
+                    if now >= self._bad_until.get(s, 0.0)
+                    and (not exclude or s not in exclude)
                 ]
             if not pool:
-                return None  # every server excluded
-            server = pool[self._rr_idx % len(pool)]
-            self._rr_idx += 1
-            return server
+                pool = [s for s in self._servers if not exclude or s not in exclude]
+            if not pool:
+                return None
 
-    def report_success(self, server: str) -> None:
+            if len(pool) == 1:
+                chosen = pool[0]
+            else:
+                a = random.choice(pool)
+                b = random.choice(pool)
+                while b == a and len(pool) > 1:
+                    b = random.choice(pool)
+
+                def _score(server: str) -> float:
+                    succ = self._success_ewma.get(server, 0.5)
+                    lat = self._latency_ewma_ms.get(server, 700.0)
+                    fail = float(self._fails.get(server, 0))
+                    inflight = float(self._inflight.get(server, 0))
+                    return (succ * 3.2) - min(3.0, lat / 250.0) - (fail * 0.2) - (inflight * 0.8)
+
+                chosen = a if _score(a) >= _score(b) else b
+
+            self._inflight[chosen] = self._inflight.get(chosen, 0) + 1
+            return chosen
+
+    def release(self, server: str) -> None:
+        with self._lock:
+            if server not in self._inflight:
+                return
+            cur = self._inflight.get(server, 0)
+            self._inflight[server] = cur - 1 if cur > 0 else 0
+
+    def report_success(self, server: str, latency_ms: float | None = None) -> None:
         with self._lock:
             self._fails[server] = 0
             self._bad_until[server] = 0.0
             self._timeout_streak[server] = 0
+            prev_succ = self._success_ewma.get(server, 0.5)
+            self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ + self._ewma_alpha
+            if latency_ms is not None:
+                prev_lat = self._latency_ewma_ms.get(server, 700.0)
+                self._latency_ewma_ms[server] = (
+                    (1.0 - self._ewma_alpha) * prev_lat + self._ewma_alpha * max(1.0, latency_ms)
+                )
 
-    def report_failure(self, server: str, is_timeout: bool = False) -> None:
+    def report_failure(
+        self,
+        server: str,
+        is_timeout: bool = False,
+        latency_ms: float | None = None,
+    ) -> None:
         now = time.time()
         with self._lock:
             f = self._fails.get(server, 0) + 1
             self._fails[server] = f
+            prev_succ = self._success_ewma.get(server, 0.5)
+            self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
+            if latency_ms is not None:
+                prev_lat = self._latency_ewma_ms.get(server, 700.0)
+                self._latency_ewma_ms[server] = (
+                    (1.0 - self._ewma_alpha) * prev_lat + self._ewma_alpha * max(1.0, latency_ms)
+                )
             if is_timeout:
                 streak = self._timeout_streak.get(server, 0) + 1
                 self._timeout_streak[server] = streak
                 if streak >= 3:
-                    # 3+ consecutive timeouts -> blacklist 60s
                     self._bad_until[server] = now + 60.0
                     if server == self._active:
                         self._active = self._preferred_server_locked(now)
@@ -145,12 +221,14 @@ class ResolverSelector:
                 self._active = self._preferred_server_locked(now)
 
     def report_nxdomain(self, server: str) -> None:
-        """NXDOMAIN = resolver can't resolve our zone. Long blacklist."""
+        """NXDOMAIN means resolver cannot resolve our zone. Long blacklist."""
         now = time.time()
         with self._lock:
             was_new = self._fails.get(server, 0) < 100
             self._fails[server] = 100
             self._bad_until[server] = now + 300.0
+            prev_succ = self._success_ewma.get(server, 0.5)
+            self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
             if server == self._active:
                 self._active = self._preferred_server_locked(now)
         if was_new:
@@ -163,10 +241,27 @@ class ResolverSelector:
             was_new = self._fails.get(server, 0) < 50
             self._fails[server] = 50
             self._bad_until[server] = now + 120.0
+            prev_succ = self._success_ewma.get(server, 0.5)
+            self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
             if server == self._active:
                 self._active = self._preferred_server_locked(now)
         if was_new:
             log.info("resolver no-answer blacklist %s for 120s", server)
+
+    def report_blocked(self, server: str, reason: str = "SERVFAIL") -> None:
+        """Resolver explicitly blocks/fails our zone (SERVFAIL/REFUSED)."""
+        now = time.time()
+        with self._lock:
+            was_new = self._fails.get(server, 0) < 80
+            self._fails[server] = 80
+            self._bad_until[server] = now + 180.0
+            self._timeout_streak[server] = 0
+            prev_succ = self._success_ewma.get(server, 0.5)
+            self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
+            if server == self._active:
+                self._active = self._preferred_server_locked(now)
+        if was_new:
+            log.info("resolver %s blacklist %s for 180s", reason, server)
 
     def rotate_active(self) -> str:
         now = time.time()
@@ -235,9 +330,22 @@ class ResolverSelector:
                     self._bad_until[s] = 0.0
                     self._order[s] = len(self._order)
                     self._timeout_streak[s] = 0
+                    self._inflight[s] = 0
+                    self._success_ewma[s] = 0.5
+                    self._latency_ewma_ms[s] = 700.0
             if self._active not in uniq:
                 self._active = uniq[0]
-            self._rr_idx = 0
+            # Trim stale stats for removed resolvers.
+            keep = set(uniq)
+            self._fails = {k: v for k, v in self._fails.items() if k in keep}
+            self._bad_until = {k: v for k, v in self._bad_until.items() if k in keep}
+            self._timeout_streak = {k: v for k, v in self._timeout_streak.items() if k in keep}
+            self._inflight = {k: v for k, v in self._inflight.items() if k in keep}
+            self._success_ewma = {k: v for k, v in self._success_ewma.items() if k in keep}
+            self._latency_ewma_ms = {
+                k: v for k, v in self._latency_ewma_ms.items() if k in keep
+            }
+            self._order = {k: v for k, v in self._order.items() if k in keep}
         log.info("resolver list updated: %s", ",".join(uniq))
 
     @property
@@ -318,16 +426,19 @@ def _query_txt(
 ) -> tuple[int, object]:
     last_err = None
     last_server = ""
-    dead_servers: set[str] = set()  # NXDOMAIN / no-answer this call
+    dead_servers: set[str] = set()   # hard-dead for this call (NXDOMAIN/blocked)
+    tried_servers: set[str] = set()  # avoid retrying same resolver in one query
     for idx in range(max(1, attempts)):
-        server = selector.choose_next(exclude=dead_servers)
+        server = selector.choose_next(exclude=dead_servers | tried_servers)
         if server is None:
-            # Every resolver returned NXDOMAIN / no-answer — bail early
+            # No untried resolver left for this query - bail early.
             break
+        tried_servers.add(server)
         last_server = server
+        t0 = time.time()
         try:
             qid, pkt = _query_pkt_direct(server, port, zone, timeout, payload, qtype)
-            selector.report_success(server)
+            selector.report_success(server, latency_ms=(time.time() - t0) * 1000.0)
             return qid, pkt
         except Exception as e:
             last_err = e
@@ -339,19 +450,36 @@ def _query_txt(
             elif "no answer" in err_str:
                 selector.report_no_answer(server)
                 dead_servers.add(server)
+            elif "SERVFAIL" in err_str:
+                selector.report_blocked(server, reason="SERVFAIL")
+                dead_servers.add(server)
+            elif "REFUSED" in err_str:
+                selector.report_blocked(server, reason="REFUSED")
+                dead_servers.add(server)
             else:
-                selector.report_failure(server, is_timeout=is_timeout)
+                selector.report_failure(
+                    server,
+                    is_timeout=is_timeout,
+                    latency_ms=(time.time() - t0) * 1000.0,
+                )
             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
-            # Skip delay for NXDOMAIN/no-answer (server is blacklisted, try next immediately)
-            if "NXDOMAIN" not in err_str and "no answer" not in err_str:
+            # Skip delay for hard-dead resolvers (try next immediately).
+            if (
+                "NXDOMAIN" not in err_str
+                and "no answer" not in err_str
+                and "SERVFAIL" not in err_str
+                and "REFUSED" not in err_str
+            ):
                 time.sleep(0.03 if idx < 3 else 0.5)
+        finally:
+            selector.release(server)
+    used = len(tried_servers)
     raise TimeoutError(
-        f"dns query failed after {attempts} attempts (last resolver {last_server}): {last_err}"
+        f"dns query failed after {used} attempts (last resolver {last_server}): {last_err}"
     )
 
 
-def run_client(
-    selector: ResolverSelector,
+def run_client(selector: ResolverSelector,
     port: int,
     zone: str,
     timeout: float,
@@ -939,27 +1067,52 @@ def main() -> None:
         help="path to resolver JSON file (auto-updated by scanner)",
     )
     p.add_argument("--resolver-fail-cooldown", type=float, default=5)
+    p.add_argument(
+        "--resolver-max-inflight",
+        type=int,
+        default=2,
+        help="max concurrent DNS queries per resolver candidate",
+    )
+    p.add_argument(
+        "--resolver-attempt-cap",
+        type=int,
+        default=6,
+        help="upper cap for auto attempts derived from resolver count",
+    )
     p.add_argument("--resolver-health-interval", type=float, default=90.0)
     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
     p.add_argument("--resolver-probe-timeout", type=float, default=1.6)
     p.add_argument("--resolver-probe-qtype", choices=["TXT", "A"], default="TXT")
     args = p.parse_args()
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
-    resolver_list = [x.strip() for x in args.server.split(",") if x.strip()]
+    seed_resolvers = _sanitize_resolvers([x.strip() for x in args.server.split(",") if x.strip()])
+    resolver_list = list(seed_resolvers)
 
-    # Load resolvers: file takes priority, CLI is fallback only
+    # Load resolvers from file (if present), with safety filtering and seed fallback.
     if args.resolver_file and os.path.isfile(args.resolver_file):
         try:
             with open(args.resolver_file, "r") as f:
                 data = json.load(f)
-            file_resolvers = data.get("resolver_list", [])
+            file_resolvers = _sanitize_resolvers(data.get("resolver_list", []))
             if file_resolvers:
                 log.info("loaded %d resolvers from %s", len(file_resolvers), args.resolver_file)
                 resolver_list = file_resolvers
+            else:
+                log.warning(
+                    "resolver file %s has no usable public resolvers; using CLI seeds",
+                    args.resolver_file,
+                )
         except Exception as e:
             log.warning("failed to read resolver file %s: %s, using CLI resolvers", args.resolver_file, e)
 
-    selector = ResolverSelector(resolver_list, fail_cooldown=args.resolver_fail_cooldown)
+    if not resolver_list:
+        raise RuntimeError("no usable public resolvers available (CLI + resolver file)")
+
+    selector = ResolverSelector(
+        resolver_list,
+        fail_cooldown=args.resolver_fail_cooldown,
+        max_inflight_per_resolver=args.resolver_max_inflight,
+    )
     log.info("active resolvers (%d): %s", len(resolver_list), ", ".join(resolver_list))
 
     # Background watcher: reload resolvers when scanner updates the file
@@ -975,9 +1128,16 @@ def main() -> None:
                     last_mtime = mtime
                     with open(path, "r") as f:
                         data = json.load(f)
-                    new_list = data.get("resolver_list", [])
-                    if new_list and new_list != sel.servers:
-                        sel.update_servers(new_list)
+                    new_list = _sanitize_resolvers(data.get("resolver_list", []))
+                    if new_list:
+                        if new_list != sel.servers:
+                            sel.update_servers(new_list)
+                    elif seed_resolvers and sel.servers != seed_resolvers:
+                        log.warning(
+                            "resolver file %s has no usable resolvers; falling back to CLI seeds",
+                            path,
+                        )
+                        sel.update_servers(seed_resolvers)
                 except Exception:
                     pass
 
@@ -995,10 +1155,17 @@ def main() -> None:
     if args.pipeline_depth <= 0:
         args.pipeline_depth = max(1, min(2, len(resolver_list)))
         log.info("auto pipeline_depth=%d (from %d resolvers)", args.pipeline_depth, len(resolver_list))
-    # Auto-scale attempts: try at least as many resolvers as available
-    if len(resolver_list) > args.attempts:
-        args.attempts = len(resolver_list)
-        log.info("auto attempts=%d (from %d resolvers)", args.attempts, len(resolver_list))
+    # Auto-scale attempts but keep a hard cap so one request won't block too long.
+    cap = max(1, int(args.resolver_attempt_cap))
+    target_attempts = min(len(resolver_list), cap)
+    if target_attempts > args.attempts:
+        args.attempts = target_attempts
+        log.info(
+            "auto attempts=%d (from %d resolvers, cap=%d)",
+            args.attempts,
+            len(resolver_list),
+            cap,
+        )
     probe_qtype = TYPE_A if args.resolver_probe_qtype == "A" else TYPE_TXT
 
     if len(resolver_list) > 1:

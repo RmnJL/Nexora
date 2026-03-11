@@ -44,24 +44,26 @@ Client options:
   --zone DOMAIN              default: t1.phonexpress.ir
   --qtype TXT|A              default: TXT
   --timeout SECONDS          default: 3
-  --attempts N               default: 3
-  --resolver-fail-cooldown   default: 20
-  --resolver-health-interval default: 120
-  --resolver-switch-interval default: 300
-  --resolver-probe-timeout   default: 1.6
+  --attempts N               default: 4
+  --resolver-attempt-cap N   default: 6
+  --resolver-fail-cooldown   default: 5
+  --resolver-max-inflight N  default: 2
+  --resolver-health-interval default: 90
+  --resolver-switch-interval default: 180
+  --resolver-probe-timeout   default: 1.4
   --resolver-probe-qtype     default: TXT
-  --tcp-chunk-size N         default: 12
+  --tcp-chunk-size N         default: 100
   --listen-host IP           default: 0.0.0.0
   --listen-port PORT         default: 1443
   --target-host IP           default: 127.0.0.1
   --target-port PORT         default: 8443
-  --max-conns N              default: 4
+  --max-conns N              default: 24
   --max-conns-per-ip N       default: 64
   --stream-open-retries N    default: 2
-  --dns-query-interval SEC   default: 0.05
-  --poll-min-interval SEC    default: 0.2
+  --dns-query-interval SEC   default: 0.04
+  --poll-min-interval SEC    default: 0.12
   --poll-max-interval SEC    default: 3.0
-  --idle-timeout SEC         default: 25
+  --idle-timeout SEC         default: 12
 EOF
 }
 
@@ -124,25 +126,27 @@ install_client() {
   local port="53"
   local zone="t1.phonexpress.ir"
   local qtype="TXT"
-  local timeout="3"
-  local attempts="3"
-  local resolver_fail_cooldown="20"
-  local resolver_health_interval="120"
-  local resolver_switch_interval="300"
-  local resolver_probe_timeout="1.6"
+  local timeout="2.5"
+  local attempts="4"
+  local resolver_attempt_cap="6"
+  local resolver_fail_cooldown="5"
+  local resolver_max_inflight="2"
+  local resolver_health_interval="90"
+  local resolver_switch_interval="180"
+  local resolver_probe_timeout="1.4"
   local resolver_probe_qtype="TXT"
-  local tcp_chunk_size="12"
+  local tcp_chunk_size="100"
   local listen_host="0.0.0.0"
   local listen_port="1443"
   local target_host="127.0.0.1"
   local target_port="8443"
-  local max_conns="4"
+  local max_conns="24"
   local max_conns_per_ip="64"
   local stream_open_retries="2"
-  local dns_query_interval="0.05"
-  local poll_min_interval="0.2"
+  local dns_query_interval="0.04"
+  local poll_min_interval="0.12"
   local poll_max_interval="3.0"
-  local idle_timeout="25"
+  local idle_timeout="12"
   local client_py="/root/nexora/src/nexora_client.py"
 
   while [[ $# -gt 0 ]]; do
@@ -153,7 +157,9 @@ install_client() {
       --qtype) qtype="${2:?}"; shift 2 ;;
       --timeout) timeout="${2:?}"; shift 2 ;;
       --attempts) attempts="${2:?}"; shift 2 ;;
+      --resolver-attempt-cap) resolver_attempt_cap="${2:?}"; shift 2 ;;
       --resolver-fail-cooldown) resolver_fail_cooldown="${2:?}"; shift 2 ;;
+      --resolver-max-inflight) resolver_max_inflight="${2:?}"; shift 2 ;;
       --resolver-health-interval) resolver_health_interval="${2:?}"; shift 2 ;;
       --resolver-switch-interval) resolver_switch_interval="${2:?}"; shift 2 ;;
       --resolver-probe-timeout) resolver_probe_timeout="${2:?}"; shift 2 ;;
@@ -189,7 +195,9 @@ NEXORA_ZONE=${zone}
 NEXORA_QTYPE=${qtype}
 NEXORA_TIMEOUT=${timeout}
 NEXORA_ATTEMPTS=${attempts}
+NEXORA_RESOLVER_ATTEMPT_CAP=${resolver_attempt_cap}
 NEXORA_RESOLVER_FAIL_COOLDOWN=${resolver_fail_cooldown}
+NEXORA_RESOLVER_MAX_INFLIGHT=${resolver_max_inflight}
 NEXORA_RESOLVER_HEALTH_INTERVAL=${resolver_health_interval}
 NEXORA_RESOLVER_SWITCH_INTERVAL=${resolver_switch_interval}
 NEXORA_RESOLVER_PROBE_TIMEOUT=${resolver_probe_timeout}
