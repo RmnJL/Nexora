@@ -928,8 +928,7 @@ def main() -> None:
     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
     resolver_list = [x.strip() for x in args.server.split(",") if x.strip()]
 
-    # Try loading from resolver file (scanner output) — MERGE with seed resolvers
-    seed_resolvers = list(resolver_list)  # keep CLI resolvers as priority
+    # Load resolvers: file takes priority, CLI is fallback only
     if args.resolver_file and os.path.isfile(args.resolver_file):
         try:
             with open(args.resolver_file, "r") as f:
@@ -937,20 +936,15 @@ def main() -> None:
             file_resolvers = data.get("resolver_list", [])
             if file_resolvers:
                 log.info("loaded %d resolvers from %s", len(file_resolvers), args.resolver_file)
-                # Seed resolvers first, then file resolvers (deduped)
-                merged = list(seed_resolvers)
-                for r in file_resolvers:
-                    if r not in merged:
-                        merged.append(r)
-                resolver_list = merged
+                resolver_list = file_resolvers
         except Exception as e:
-            log.warning("failed to read resolver file %s: %s", args.resolver_file, e)
+            log.warning("failed to read resolver file %s: %s, using CLI resolvers", args.resolver_file, e)
 
     selector = ResolverSelector(resolver_list, fail_cooldown=args.resolver_fail_cooldown)
 
     # Background watcher: reload resolvers when scanner updates the file
     if args.resolver_file:
-        def _watch_resolver_file(path: str, sel: ResolverSelector, seeds: list[str]) -> None:
+        def _watch_resolver_file(path: str, sel: ResolverSelector) -> None:
             last_mtime = 0.0
             while True:
                 time.sleep(30)
@@ -962,19 +956,14 @@ def main() -> None:
                     with open(path, "r") as f:
                         data = json.load(f)
                     new_list = data.get("resolver_list", [])
-                    if new_list:
-                        merged = list(seeds)
-                        for r in new_list:
-                            if r not in merged:
-                                merged.append(r)
-                        if merged != sel.servers:
-                            sel.update_servers(merged)
+                    if new_list and new_list != sel.servers:
+                        sel.update_servers(new_list)
                 except Exception:
                     pass
 
         wt = threading.Thread(
             target=_watch_resolver_file,
-            args=(args.resolver_file, selector, seed_resolvers),
+            args=(args.resolver_file, selector),
             daemon=True,
         )
         wt.start()
