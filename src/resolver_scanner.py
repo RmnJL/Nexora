@@ -28,6 +28,20 @@ from dataclasses import dataclass, asdict, field
 from threading import Event, Lock
 from typing import Optional
 
+from nexora_proto import (
+    TYPE_DATA,
+    TYPE_DATA_ACK,
+    TYPE_HELLO,
+    TYPE_HELLO_ACK,
+    TYPE_STREAM_CLOSE,
+    TYPE_STREAM_OPEN,
+    TYPE_STREAM_OPEN_ACK,
+    TYPE_STREAM_RECV,
+    TYPE_STREAM_SEND,
+    pack_packet,
+    unpack_packet,
+)
+
 log = logging.getLogger("nexora-scanner")
 
 # ---------------------------------------------------------------------------
@@ -37,10 +51,6 @@ log = logging.getLogger("nexora-scanner")
 _DNS_TYPE_A = 1
 _DNS_TYPE_TXT = 16
 _DNS_TYPE_NS = 2
-_PROTO_MAGIC = b"NXR1"
-_PROTO_HDR = struct.Struct(">4sBIIH")
-_PROTO_TYPE_HELLO = 1
-_PROTO_TYPE_HELLO_ACK = 2
 
 
 def _encode_dns_name(name: str) -> bytes:
@@ -129,6 +139,8 @@ class ProbeResult:
     tunnel_realistic: bool = False
     nxdomain_correct: bool = False
     bidirectional: bool = False
+    protocol_roundtrip: bool = False
+    stream_roundtrip: bool = False
     latency_ms: float = 9999.0
     score: int = 0
     error: Optional[str] = None
@@ -274,45 +286,170 @@ def _extract_txt_strings(packet: bytes) -> list[bytes]:
     return results
 
 
+def _extract_nexora_packets(packet: bytes) -> list[object]:
+    """Decode TXT answers into Nexora protocol packets."""
+    out: list[object] = []
+    for txt_chunk in _extract_txt_strings(packet):
+        try:
+            raw = _b32_decode_loose(txt_chunk)
+            out.append(unpack_packet(raw))
+        except Exception:
+            continue
+    return out
+
+
 def _test_bidirectional(resolver: str, port: int,
                        zone: str, timeout: float) -> bool:
     """Verify full Nexora protocol round-trip (HELLO -> HELLO_ACK)."""
     nonce = secrets.randbits(32)
-    payload = b"HP"
-    hello = _PROTO_HDR.pack(
-        _PROTO_MAGIC,
-        _PROTO_TYPE_HELLO,
-        0,
-        nonce,
-        len(payload),
-    ) + payload
+    hello = pack_packet(TYPE_HELLO, 0, nonce, b"HP")
     fqdn = f"{_chunk_label(_b32_encode_nopad(hello))}.{zone}"
     try:
         rcode, resp = _dns_query(resolver, port, fqdn, _DNS_TYPE_TXT, timeout)
         if rcode != 0:
             return False
-        txt_strings = _extract_txt_strings(resp)
-        for s in txt_strings:
-            try:
-                raw = _b32_decode_loose(s)
-            except Exception:
-                continue
-            if len(raw) < _PROTO_HDR.size:
-                continue
-            magic, msg_type, _sid, rnonce, paylen = _PROTO_HDR.unpack(raw[: _PROTO_HDR.size])
-            if magic != _PROTO_MAGIC:
-                continue
-            if msg_type != _PROTO_TYPE_HELLO_ACK:
-                continue
-            if rnonce != nonce:
-                continue
-            if len(raw) != _PROTO_HDR.size + paylen:
-                continue
-            # Valid Nexora HELLO_ACK response proves true bi-directional path.
-            return True
+        for pkt in _extract_nexora_packets(resp):
+            if pkt.msg_type == TYPE_HELLO_ACK and pkt.nonce == nonce and pkt.session_id > 0:
+                # Valid Nexora HELLO_ACK response proves true bi-directional path.
+                return True
         return False
     except Exception:
         return False
+
+
+def _probe_open_session(
+    resolver: str,
+    port: int,
+    zone: str,
+    timeout: float,
+) -> tuple[int, int]:
+    """Return (sid, nonce) from a valid HELLO_ACK, or (0, 0) on failure."""
+    hello_nonce = secrets.randbits(32)
+    hello_pkt = pack_packet(TYPE_HELLO, 0, hello_nonce, b"SCN_HELLO")
+    hello_q = f"{_chunk_label(_b32_encode_nopad(hello_pkt))}.{zone}"
+    rcode, resp = _dns_query(resolver, port, hello_q, _DNS_TYPE_TXT, timeout)
+    if rcode != 0:
+        return 0, 0
+    for pkt in _extract_nexora_packets(resp):
+        if (
+            pkt.msg_type == TYPE_HELLO_ACK
+            and pkt.nonce == hello_nonce
+            and pkt.session_id > 0
+        ):
+            return pkt.session_id, hello_nonce
+    return 0, 0
+
+
+def _test_protocol_roundtrip(resolver: str, port: int,
+                            zone: str, timeout: float) -> bool:
+    """Verify HELLO_ACK + DATA_ACK path using same session (real protocol path)."""
+    try:
+        sid, _ = _probe_open_session(resolver, port, zone, timeout)
+        if sid <= 0:
+            return False
+
+        data_nonce = secrets.randbits(32)
+        data_pkt = pack_packet(TYPE_DATA, sid, data_nonce, b"SCN_DATA")
+        data_q = f"{_chunk_label(_b32_encode_nopad(data_pkt))}.{zone}"
+        rcode2, resp2 = _dns_query(resolver, port, data_q, _DNS_TYPE_TXT, timeout)
+        if rcode2 != 0:
+            return False
+        for pkt in _extract_nexora_packets(resp2):
+            if (
+                pkt.msg_type == TYPE_DATA_ACK
+                and pkt.session_id == sid
+                and pkt.nonce == data_nonce
+            ):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _test_stream_roundtrip(
+    resolver: str,
+    port: int,
+    zone: str,
+    timeout: float,
+) -> bool:
+    """Verify STREAM_OPEN_ACK + STREAM_RECV/CLOSE using realistic payload sizes."""
+    try:
+        sid, _ = _probe_open_session(resolver, port, zone, timeout)
+        if sid <= 0:
+            return False
+
+        open_nonce = secrets.randbits(32)
+        # Intentional local target; ER is acceptable as long as protocol ACK returns.
+        open_pkt = pack_packet(TYPE_STREAM_OPEN, sid, open_nonce, b"127.0.0.1:1")
+        open_q = f"{_chunk_label(_b32_encode_nopad(open_pkt))}.{zone}"
+        rcode_o, resp_o = _dns_query(resolver, port, open_q, _DNS_TYPE_TXT, timeout)
+        if rcode_o != 0:
+            return False
+        got_open_ack = False
+        for pkt in _extract_nexora_packets(resp_o):
+            if (
+                pkt.msg_type == TYPE_STREAM_OPEN_ACK
+                and pkt.session_id == sid
+                and pkt.nonce == open_nonce
+            ):
+                got_open_ack = True
+                break
+        if not got_open_ack:
+            return False
+
+        send_nonce = secrets.randbits(32)
+        # Near runtime payload size to catch resolvers that fail on long labels.
+        send_payload = b"S" * 100
+        send_pkt = pack_packet(TYPE_STREAM_SEND, sid, send_nonce, send_payload)
+        send_q = f"{_chunk_label(_b32_encode_nopad(send_pkt))}.{zone}"
+        rcode_s, resp_s = _dns_query(resolver, port, send_q, _DNS_TYPE_TXT, timeout)
+        if rcode_s != 0:
+            return False
+        for pkt in _extract_nexora_packets(resp_s):
+            if pkt.session_id != sid or pkt.nonce != send_nonce:
+                continue
+            if pkt.msg_type in (TYPE_STREAM_RECV, TYPE_STREAM_CLOSE):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _test_stream_roundtrip_stability(
+    resolver: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    rounds: int = 2,
+    min_success: int = 2,
+) -> bool:
+    ok = 0
+    total = max(1, rounds)
+    need = max(1, min(min_success, total))
+    for _ in range(total):
+        if _test_stream_roundtrip(resolver, port, zone, timeout):
+            ok += 1
+        time.sleep(0.03)
+    return ok >= need
+
+
+def _test_protocol_roundtrip_stability(
+    resolver: str,
+    port: int,
+    zone: str,
+    timeout: float,
+    rounds: int = 2,
+    min_success: int = 2,
+) -> bool:
+    """Run protocol roundtrip more than once to avoid one-shot false positives."""
+    ok = 0
+    total = max(1, rounds)
+    need = max(1, min(min_success, total))
+    for _ in range(total):
+        if _test_protocol_roundtrip(resolver, port, zone, timeout):
+            ok += 1
+        time.sleep(0.03)
+    return ok >= need
 
 
 def _measure_latency(resolver: str, port: int,
@@ -364,17 +501,31 @@ def probe_resolver(resolver: str, port: int, zone: str,
             resolver, port, zone, timeout
         )
 
+    # Test 6: Real protocol path with sessioned DATA roundtrip.
+    if result.bidirectional:
+        result.protocol_roundtrip = _test_protocol_roundtrip_stability(
+            resolver, port, zone, timeout
+        )
+
+    # Test 7: Stream path roundtrip (OPEN/SEND) with runtime-like payload sizes.
+    if result.protocol_roundtrip:
+        result.stream_roundtrip = _test_stream_roundtrip_stability(
+            resolver, port, zone, timeout
+        )
+
     # Measure latency only if resolver passes subdomain test
     if result.random_subdomain:
         result.latency_ms = _measure_latency(resolver, port, zone, timeout)
 
-    # Score: 0-5 (each passed test = 1 point)
+    # Score: 0-7 (each passed test = 1 point)
     result.score = sum([
         result.reachable,
         result.random_subdomain,
         result.tunnel_realistic,
         result.nxdomain_correct,
         result.bidirectional,
+        result.protocol_roundtrip,
+        result.stream_roundtrip,
     ])
 
     return result
@@ -550,6 +701,8 @@ def _is_working_result(r: ProbeResult) -> bool:
         r.reachable
         and r.tunnel_realistic
         and r.bidirectional
+        and r.protocol_roundtrip
+        and r.stream_roundtrip
         and r.nxdomain_correct
     )
 
@@ -678,9 +831,9 @@ def run_scan(zone: str, port: int = 53, timeout: float = 3.0,
     )
     for i, r in enumerate(top):
         log.info(
-            "  #%d %s score=%d/5 latency=%.0fms tunnel=%s nxdomain=%s bidir=%s",
+            "  #%d %s score=%d/7 latency=%.0fms tunnel=%s nxdomain=%s bidir=%s proto=%s stream=%s",
             i + 1, r.resolver, r.score, r.latency_ms,
-            r.tunnel_realistic, r.nxdomain_correct, r.bidirectional,
+            r.tunnel_realistic, r.nxdomain_correct, r.bidirectional, r.protocol_roundtrip, r.stream_roundtrip,
         )
 
     return ScanReport(
@@ -773,7 +926,7 @@ def _build_continuous_report(
 
         quality = _runtime_quality_score(st, now_ts)
         row = asdict(st.last_pass_result)
-        row["score"] = max(0.0, min(5.0, round(st.ewma_score, 2)))
+        row["score"] = max(0.0, min(7.0, round(st.ewma_score, 2)))
         row["latency_ms"] = round(st.ewma_latency_ms, 1)
         row["runtime_quality"] = round(quality, 3)
         row["runtime_probes"] = st.probes
@@ -816,7 +969,7 @@ def _build_continuous_report(
                 continue
             quality = _runtime_quality_score(st, now_ts)
             row = asdict(st.last_pass_result)
-            row["score"] = max(0.0, min(5.0, round(st.ewma_score, 2)))
+            row["score"] = max(0.0, min(7.0, round(st.ewma_score, 2)))
             row["latency_ms"] = round(st.ewma_latency_ms, 1)
             row["runtime_quality"] = round(quality, 3)
             row["runtime_probes"] = st.probes
