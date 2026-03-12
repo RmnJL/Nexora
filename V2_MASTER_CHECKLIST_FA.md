@@ -148,8 +148,8 @@
 
 ## 8) خروجی های اجباری قبل از شروع کدنویسی v2
 
-- [ ] `docs/V2_PROTOCOL_SPEC.md`
-- [ ] `docs/V2_FLOW_STATE_MACHINE.md`
+- [x] `docs/V2_PROTOCOL_SPEC.md`
+- [x] `docs/V2_FLOW_STATE_MACHINE.md`
 - [ ] `docs/V2_TEST_PLAN.md`
 - [ ] `docs/V2_ROLLOUT_PLAN.md`
 
