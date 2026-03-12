@@ -211,6 +211,56 @@ class TestQueryRetryStickiness(unittest.TestCase):
         self.assertIn("1.1.1.1", seen_servers)
         self.assertGreaterEqual(len(set(seen_servers)), 2)
 
+    def test_broadcast_failure_falls_back_to_serial_even_when_fanout_matches_pool(self):
+        selector = ResolverSelector(
+            ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
+            fail_streak_before_blacklist=20,
+        )
+        seen_servers: list[str] = []
+        attempts = {"n": 0}
+        old_kpi = nexora_client._runtime_kpi
+        nexora_client._runtime_kpi = nexora_client._RuntimeKpi()
+
+        def _fake_query(server, port, zone, timeout, payload, qtype):
+            seen_servers.append(server)
+            attempts["n"] += 1
+            if attempts["n"] <= 3:
+                raise TimeoutError("timed out")
+            return 701, object()
+
+        try:
+            with (
+                patch("nexora_client._query_pkt_direct", side_effect=_fake_query),
+                patch.object(nexora_client, "_resolver_broadcast_enabled", True),
+                patch.object(nexora_client, "_resolver_broadcast_fanout", 3),
+                patch.object(nexora_client, "_resolver_broadcast_timeout", 0.3),
+                patch.object(
+                    nexora_client,
+                    "_resolver_broadcast_per_resolver_timeout",
+                    0.3,
+                ),
+                patch.object(nexora_client, "_resolver_last_chance_fallback", False),
+                patch.object(nexora_client, "_resolver_parallel_fallback", False),
+                patch("nexora_client.time.sleep", return_value=None),
+            ):
+                qid, _ = _query_txt(
+                    selector=selector,
+                    port=53,
+                    zone="example.com",
+                    timeout=0.3,
+                    payload=b"x",
+                    attempts=1,
+                    qtype=TYPE_TXT,
+                )
+            snap = nexora_client._runtime_kpi.snapshot()
+        finally:
+            nexora_client._runtime_kpi = old_kpi
+
+        self.assertEqual(qid, 701)
+        self.assertEqual(len(seen_servers), 4)
+        self.assertEqual(snap["broadcast_fail_count"], 1)
+        self.assertEqual(snap["fallback_success_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

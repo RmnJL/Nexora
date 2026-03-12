@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-The key insight: **instead of routing queries through a single resolver**, broadcast the same packet simultaneously to **N resolvers (3-5)** and accept the **first valid response**. This transforms a pool of weak resolvers (40-60% success each) into a highly reliable system (98-99%+ success).
+The key insight: **instead of routing queries through a single resolver**, broadcast the same packet simultaneously to **N resolvers (3-5)** and accept the **first valid response**. This transforms a pool of weak resolvers (40-60% success each) into a much more reliable system (about 92-99%+ depending on resolver quality and fanout).
 
 **Why this works:**
 - Query ID (nonce + session_id) is **idempotent**: the same query to different resolvers returns the same response
@@ -686,7 +686,7 @@ nexora-client \
 # Disable for testing
 nexora-client \
     --server 8.8.8.8 \
-    --broadcast-disable \
+    --no-broadcast-enable \
     --zone t1.phonexpress.ir
 ```
 

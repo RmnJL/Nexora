@@ -1014,12 +1014,19 @@ def _query_txt(
                     )
                     _runtime_kpi.record_broadcast(False)
                     
-                    # HIGH FIX: Immediate serial fallback after broadcast fails
-                    # Try single resolver instead of just retrying broadcast
+                    # Immediate serial fallback after broadcast failure.
+                    # Prefer a resolver outside broadcast set first; if none are
+                    # available, retry one resolver from the same broadcast pool.
                     fallback_resolver = selector.choose_next(exclude=dead_servers | set(chosen))
+                    reused_broadcast_resolver = False
+                    if fallback_resolver is None:
+                        fallback_resolver = selector.choose_next(exclude=dead_servers)
+                        reused_broadcast_resolver = fallback_resolver in set(chosen) if fallback_resolver else False
                     if fallback_resolver is not None:
+                        fallback_mode = "reuse-broadcast" if reused_broadcast_resolver else "fresh-resolver"
                         log.info(
-                            "broadcast failed, attempting serial fallback resolver=%s",
+                            "broadcast failed, attempting serial fallback mode=%s resolver=%s",
+                            fallback_mode,
                             fallback_resolver,
                         )
                         try:
@@ -1959,7 +1966,7 @@ def main() -> None:
         dest="resolver_broadcast_timeout",
         type=float,
         default=2.8,
-        help="overall timeout budget for broadcast query (must be < client timeout)",
+        help="overall timeout budget for broadcast query (seconds)",
     )
     p.add_argument(
         "--broadcast-per-resolver-timeout",

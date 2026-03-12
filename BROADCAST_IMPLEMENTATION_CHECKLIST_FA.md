@@ -30,7 +30,7 @@
 - [x] اضافه‌کردن log ساخت‌یافته برای retry/backoff (metric-ready).
 
 **پذیرش فاز 1**
-- [x] تست‌های فعلی هسته پاس باشند: `48 passed`.
+- [x] تست‌های فعلی هسته پاس باشند: `68 passed`.
 - [ ] هیچ رگرسیون در handshake/data/stream رخ ندهد.
 
 ---
@@ -39,14 +39,14 @@
 - [ ] پیاده‌سازی `BroadcastQueryManager` production-grade (نه نسخه دمو).
 - [x] انتخاب resolverها با اولویت کیفیت واقعی selector (نه random ساده).
 - [x] افزودن پارامترها:
-  - [ ] `--broadcast-enable/disable`
+  - [x] `--broadcast-enable/disable`
   - [x] `--broadcast-fanout` (پیش‌فرض 10)
   - [x] `--broadcast-timeout`
   - [x] `--broadcast-per-resolver-timeout`
 - [x] پیاده‌سازی `first valid response wins` با cancel صحیح losers.
 - [x] اتصال به `ResolverSelector.report_success/failure` برای هر resolver شرکت‌کننده.
 - [ ] طراحی استراتژی fallback:
-  - [ ] اگر broadcast fail شد -> مسیر serial فعلی
+  - [x] اگر broadcast fail شد -> مسیر serial فعلی
   - [x] اگر بخشی fail شد -> ادامه با پاسخ winner
 
 **پذیرش فاز 2**
@@ -72,13 +72,13 @@
 
 ## 4) فاز تست و کیفیت
 - [ ] اصلاح کامل `tests/test_broadcast_redundancy.py`:
-  - [ ] importهای ناقص
-  - [ ] فرمول‌های ریاضی اشتباه
+  - [x] importهای ناقص
+  - [x] فرمول‌های ریاضی اشتباه
   - [ ] benchmarkهای غیرواقعی
 - [ ] افزودن unit testهای جدید:
   - [ ] fanout=10 success/failure mix
   - [ ] cancel path
-  - [ ] fallback to serial
+  - [x] fallback to serial
   - [x] nonce/session validation
   - [x] inflight guard behavior
 - [ ] افزودن integration test:
@@ -121,8 +121,8 @@
 
 ## 7) تنظیمات پیشنهادی شروع (نسخه اول)
 - [x] `broadcast_fanout=10`
-- [ ] `broadcast_timeout=2.8s`
-- [ ] `broadcast_per_resolver_timeout=1.2s`
+- [x] `broadcast_timeout=2.8s`
+- [x] `broadcast_per_resolver_timeout=1.2s`
 - [x] `resolver_max_inflight=1` (تا بعد از KPI اولیه)
 - [x] `resolver_attempt_cap=6` (با بازنگری بعد از KPI)
 
@@ -141,3 +141,5 @@
 ## Work Log
 - [x] 2026-03-12: ایجاد چک‌لیست اجرایی broadcast/multipath. (RmnJL)
 - [x] 2026-03-12: Checklist reviewed and completed items were checked against current code/tests. (Codex)
+- [x] 2026-03-12: بازبینی عمیق پس از تغییرات جدید؛ آیتم‌های دارای شواهد مستقیم در کد/تست تیک شد. (Codex)
+- [x] 2026-03-12: فیکس fallback در حالت fanout=pool + افزودن تست رگرسیون + sync مستندات CLI. (Codex)

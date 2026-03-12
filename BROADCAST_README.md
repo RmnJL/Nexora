@@ -194,7 +194,7 @@ Review test output to understand behavior.
    selector = ResolverSelector(args.server.split(","))
    
    broadcaster = None
-   if args.broadcast_enable and not args.broadcast_disable:
+   if args.broadcast_enable:
        broadcaster = BroadcastQueryManager(
            selector,
            num_parallel=args.broadcast_num_parallel,
