@@ -79,6 +79,16 @@ class TestResolverSelectorStickyPolicy(unittest.TestCase):
         picked = selector.choose_next()
         self.assertEqual(picked, "8.8.8.8")
 
+    def test_update_servers_reorders_preference_and_rotates_degraded_active(self):
+        selector = ResolverSelector(["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+        selector.report_failure("1.1.1.1", is_timeout=False)
+        selector.update_servers(["9.9.9.9", "8.8.8.8", "1.1.1.1"])
+
+        self.assertEqual(selector.active, "9.9.9.9")
+        picked = selector.choose_next(exclude={"9.9.9.9"})
+        self.assertEqual(picked, "8.8.8.8")
+        selector.release(picked)
+
 
 class TestQueryRetryStickiness(unittest.TestCase):
     def test_query_retries_same_resolver_before_failover(self):

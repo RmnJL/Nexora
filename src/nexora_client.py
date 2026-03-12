@@ -676,13 +676,16 @@ class ResolverSelector:
         if not uniq:
             return
         with self._lock:
+            now = time.time()
             old = set(self._servers)
             self._servers = uniq
+            # Rebuild order from the latest scanner ranking so tie-breakers
+            # prefer fresh top resolvers instead of stale historical order.
+            self._order = {s: i for i, s in enumerate(uniq)}
             for s in uniq:
                 if s not in old:
                     self._fails[s] = 0
                     self._bad_until[s] = 0.0
-                    self._order[s] = len(self._order)
                     self._timeout_streak[s] = 0
                     self._soft_fail_streak[s] = 0
                     self._inflight[s] = 0
@@ -690,6 +693,19 @@ class ResolverSelector:
                     self._latency_ewma_ms[s] = 700.0
             if self._active not in uniq:
                 self._set_active_locked(uniq[0])
+            else:
+                top = uniq[0]
+                active_bad = now < self._bad_until.get(self._active, 0.0)
+                top_bad = now < self._bad_until.get(top, 0.0)
+                active_fails = self._fails.get(self._active, 0)
+                # When scanner ranking changes, don't stay sticky on a degraded
+                # active resolver; converge to top-ranked healthy candidate.
+                if (
+                    self._active != top
+                    and (active_bad or active_fails > 0)
+                    and (not top_bad)
+                ):
+                    self._set_active_locked(top)
             # Trim stale stats for removed resolvers.
             keep = set(uniq)
             self._fails = {k: v for k, v in self._fails.items() if k in keep}
@@ -701,7 +717,6 @@ class ResolverSelector:
             self._latency_ewma_ms = {
                 k: v for k, v in self._latency_ewma_ms.items() if k in keep
             }
-            self._order = {k: v for k, v in self._order.items() if k in keep}
         log.info("resolver list updated: %s", ",".join(uniq))
 
     @property
