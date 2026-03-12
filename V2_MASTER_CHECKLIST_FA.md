@@ -150,8 +150,8 @@
 
 - [x] `docs/V2_PROTOCOL_SPEC.md`
 - [x] `docs/V2_FLOW_STATE_MACHINE.md`
-- [ ] `docs/V2_TEST_PLAN.md`
-- [ ] `docs/V2_ROLLOUT_PLAN.md`
+- [x] `docs/V2_TEST_PLAN.md`
+- [x] `docs/V2_ROLLOUT_PLAN.md`
 
 ---
 
