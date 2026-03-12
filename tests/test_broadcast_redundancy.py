@@ -249,7 +249,7 @@ class TestBroadcastParallel:
         Test: Broadcast 5 resolvers @ 40% success each.
         
         This simulates the user's actual condition: weak DNS pool.
-        Theoretical: 1 - (0.6^5) = 99.23%
+        Theoretical: 1 - (0.6^5) = 92.22%
         """
         num_samples = 50
         successes = 0
@@ -309,7 +309,7 @@ class TestBroadcastParallel:
         avg_latency = total_time / num_samples
         
         print(f"✓ Broadcast 5x40% test PASSED:")
-        print(f"  - Success rate: {success_rate:.1f}% (expected ~99.2%)")
+        print(f"  - Success rate: {success_rate:.1f}% (expected ~92.2%)")
         print(f"  - Avg latency: {avg_latency:.3f}s")
 
 
@@ -361,7 +361,7 @@ class TestSuccessRateMath:
         expected = 0.92224
         result = self.calculate_broadcast_success(p, 5)
         assert abs(result - expected) < 0.001
-        print(f"✓ Broadcast 5 (p={p}): {result:.1%} (expected ~99.2%)")
+        print(f"✓ Broadcast 5 (p={p}): {result:.1%} (expected ~92.2%)")
 
 
 # ============================================================================

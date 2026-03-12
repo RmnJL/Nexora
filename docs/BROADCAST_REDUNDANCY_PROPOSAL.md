@@ -25,7 +25,7 @@ Broadcast 4 @ 50% each:           93.75% (1 - 0.5⁴)
 Broadcast 5 @ 50% each:           96.875% (1 - 0.5⁵)
 
 ⭐ With 40% resolver pool:
-Broadcast 5 @ 40% each:           1 - (0.6⁵) = 99.2%
+Broadcast 5 @ 40% each:           1 - (0.6⁵) = 92.2%
 ```
 
 ---
@@ -664,7 +664,7 @@ Single resolver             40%      60%      1
 Single + 3 retries          78.4%    21.6%    ~4
 Dual-path                   64%      36%      2
 Broadcast 4x parallel       97.4%    2.6%     4
-Broadcast 5x parallel       99.2%    0.8%     5
+Broadcast 5x parallel       92.2%    0.8%     5
 Broadcast 5x + FEC          99.98%   0.02%    7.5 avg
 ```
 

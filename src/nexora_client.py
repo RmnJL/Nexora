@@ -1013,6 +1013,46 @@ def _query_txt(
                         ",".join(chosen),
                     )
                     _runtime_kpi.record_broadcast(False)
+                    
+                    # HIGH FIX: Immediate serial fallback after broadcast fails
+                    # Try single resolver instead of just retrying broadcast
+                    fallback_resolver = selector.choose_next(exclude=dead_servers | set(chosen))
+                    if fallback_resolver is not None:
+                        log.info(
+                            "broadcast failed, attempting serial fallback resolver=%s",
+                            fallback_resolver,
+                        )
+                        try:
+                            sent_fb = time.time()
+                            fb_payload = _payload_with_retry_count(payload, attempts_made + 1)
+                            attempts_made += 1
+                            qid, pkt = _query_pkt_direct(
+                                fallback_resolver,
+                                port,
+                                zone,
+                                timeout,
+                                fb_payload,
+                                qtype,
+                            )
+                            selector.report_success(
+                                fallback_resolver,
+                                latency_ms=(time.time() - sent_fb) * 1000.0,
+                            )
+                            _runtime_kpi.record_fallback(True)
+                            _record_query_result(success=True, resolver=fallback_resolver)
+                            log.info("serial fallback succeeded resolver=%s", fallback_resolver)
+                            return (qid, pkt)
+                        except Exception as fb_err:
+                            _record_failure(fallback_resolver, fb_err, sent_fb)
+                            _runtime_kpi.record_fallback(False)
+                            log.warning(
+                                "serial fallback failed resolver=%s error=%s",
+                                fallback_resolver,
+                                str(fb_err),
+                            )
+                        finally:
+                            selector.release(fallback_resolver)
+                    
                     # Skip delay for hard-dead outcomes (same as serial path).
                     if idx < total_attempts - 1 and (
                         last_err is None
@@ -1896,29 +1936,38 @@ def main() -> None:
         default=True,
         help="run primary+backup in parallel on final attempt and accept first success",
     )
+    # Broadcast mode: Multiple resolvers per query + first-wins
     p.add_argument(
+        "--broadcast-enable",
         "--resolver-broadcast",
+        dest="resolver_broadcast",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="send each query to multiple resolvers and accept first success",
     )
     p.add_argument(
+        "--broadcast-num-parallel",
         "--resolver-broadcast-fanout",
+        dest="resolver_broadcast_fanout",
         type=int,
         default=10,
         help="number of parallel resolvers per query when broadcast mode is enabled",
     )
     p.add_argument(
+        "--broadcast-timeout",
         "--resolver-broadcast-timeout",
+        dest="resolver_broadcast_timeout",
         type=float,
-        default=0.0,
-        help="overall timeout budget for broadcast query (<=0 uses --timeout)",
+        default=2.8,
+        help="overall timeout budget for broadcast query (must be < client timeout)",
     )
     p.add_argument(
+        "--broadcast-per-resolver-timeout",
         "--resolver-broadcast-per-resolver-timeout",
+        dest="resolver_broadcast_per_resolver_timeout",
         type=float,
-        default=0.0,
-        help="per-resolver timeout in broadcast mode (<=0 uses --timeout)",
+        default=1.2,
+        help="per-resolver timeout in broadcast mode",
     )
     p.add_argument(
         "--kpi-summary-interval",

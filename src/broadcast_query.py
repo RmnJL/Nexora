@@ -1,8 +1,18 @@
 """
 Broadcast Query Redundancy Implementation for Nexora.
 
-This module provides BroadcastQueryManager class for parallel DNS queries.
-Integration with nexora_client.py:
+⚠️  CONSOLIDATION NOTE (2026-03-12):
+This module is being consolidated. The primary broadcast implementation is now in 
+nexora_client.py (see _query_txt_or_stream function, lines ~937+).
+
+This BroadcastQueryManager class remains for reference and can be used for standalone
+tests, but the main query execution path uses the implementation in nexora_client.py
+which is better integrated with ResolverSelector feedback loops.
+
+TODO (Phase 2): Consider removing this module or refactoring nexora_client.py 
+to use this class to reduce duplication.
+
+Legacy Integration Pattern (NOT CURRENTLY USED):
     
     from broadcast_query import BroadcastQueryManager
     from nexora_client import ResolverSelector
@@ -21,6 +31,7 @@ Integration with nexora_client.py:
 
 Author: Nexora Team
 Date: March 12, 2026
+Consolidation: March 12, 2026
 """
 
 import logging
