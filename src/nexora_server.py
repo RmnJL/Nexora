@@ -510,10 +510,17 @@ def run_server(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Nexora phase-1 server")
+    p = argparse.ArgumentParser(description="Nexora server")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=53)
     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
+    p.add_argument(
+        "--protocol-version",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="protocol version selector (v2 uses scaffold mode in this phase)",
+    )
     p.add_argument(
         "--log-level",
         default="INFO",
@@ -537,6 +544,13 @@ def main() -> None:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    if int(args.protocol_version) == 2:
+        log.warning(
+            (
+                "protocol v2 scaffold enabled on server: v1 DNS handler remains "
+                "active while v2 data-path integration is in progress"
+            )
+        )
     run_server(
         args.bind,
         args.port,

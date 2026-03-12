@@ -43,6 +43,7 @@ from nexora_proto import (
     random_nonce,
     unpack_packet,
 )
+from nexora_v2 import CarrierManager, StreamMux
 
 log = logging.getLogger("nexora-client")
 
@@ -1911,7 +1912,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    p = argparse.ArgumentParser(description="Nexora phase-1 client")
+    p = argparse.ArgumentParser(description="Nexora client")
     p.add_argument(
         "--server",
         required=True,
@@ -1922,6 +1923,13 @@ def main() -> None:
     p.add_argument("--timeout", type=float, default=2.0)
     p.add_argument("--attempts", type=int, default=3)
     p.add_argument("--qtype", choices=["TXT", "A"], default="TXT")
+    p.add_argument(
+        "--protocol-version",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="protocol version selector (v2 is scaffold mode in this phase)",
+    )
     p.add_argument("--tcp-test-host", default="")
     p.add_argument("--tcp-test-port", type=int, default=80)
     p.add_argument(
@@ -2133,6 +2141,30 @@ def main() -> None:
 
     if not resolver_list:
         raise RuntimeError("no usable public resolvers available (CLI + resolver file)")
+
+    if int(args.protocol_version) == 2:
+        log.warning(
+            (
+                "protocol v2 scaffold enabled: carrier control-plane is active, "
+                "data-plane still uses v1 stream path"
+            )
+        )
+        try:
+            carrier_mgr = CarrierManager(
+                resolver_list,
+                max_carriers=min(3, len(resolver_list)),
+            )
+            carriers = carrier_mgr.bootstrap()
+            mux = StreamMux()
+            log.info(
+                "v2 scaffold bootstrap epoch=%d carriers=%d ids=%s streams=%d",
+                carrier_mgr.epoch,
+                len(carriers),
+                ",".join(str(c.carrier_id) for c in carriers),
+                mux.active_count(),
+            )
+        except Exception as e:
+            raise RuntimeError(f"v2 scaffold bootstrap failed: {e}")
 
     selector = ResolverSelector(
         resolver_list,

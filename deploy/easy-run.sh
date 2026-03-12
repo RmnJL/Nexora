@@ -35,6 +35,7 @@ Server options:
   --bind IP                  default: 0.0.0.0
   --port PORT                default: 53
   --zone DOMAIN              default: t1.phonexpress.ir
+  --protocol-version 1|2     default: 1
   --session-ttl SECONDS      default: 900
   --cleanup-interval SECONDS default: 60
   --log-level LEVEL          default: WARNING
@@ -44,6 +45,7 @@ Client options:
   --port PORT                default: 53
   --zone DOMAIN              default: t1.phonexpress.ir
   --qtype TXT|A              default: TXT
+  --protocol-version 1|2     default: 1
   --timeout SECONDS          default: 3
   --attempts N               default: 4
   --resolver-attempt-cap N   default: 6
@@ -97,6 +99,7 @@ install_server() {
   local bind="0.0.0.0"
   local port="53"
   local zone="t1.phonexpress.ir"
+  local protocol_version="1"
   local session_ttl="900"
   local cleanup_interval="60"
   local log_level="WARNING"
@@ -107,6 +110,7 @@ install_server() {
       --bind) bind="${2:?}"; shift 2 ;;
       --port) port="${2:?}"; shift 2 ;;
       --zone) zone="${2:?}"; shift 2 ;;
+      --protocol-version) protocol_version="${2:?}"; shift 2 ;;
       --session-ttl) session_ttl="${2:?}"; shift 2 ;;
       --cleanup-interval) cleanup_interval="${2:?}"; shift 2 ;;
       --log-level) log_level="${2:?}"; shift 2 ;;
@@ -126,6 +130,7 @@ NEXORA_SERVER_PY=${server_py}
 NEXORA_BIND=${bind}
 NEXORA_PORT=${port}
 NEXORA_ZONE=${zone}
+NEXORA_PROTOCOL_VERSION=${protocol_version}
 NEXORA_SESSION_TTL=${session_ttl}
 NEXORA_CLEANUP_INTERVAL=${cleanup_interval}
 NEXORA_LOG_LEVEL=${log_level}
@@ -140,6 +145,7 @@ install_client() {
   local port="53"
   local zone="t1.phonexpress.ir"
   local qtype="TXT"
+  local protocol_version="1"
   local timeout="2.5"
   local attempts="4"
   local resolver_attempt_cap="6"
@@ -178,6 +184,7 @@ install_client() {
       --port) port="${2:?}"; shift 2 ;;
       --zone) zone="${2:?}"; shift 2 ;;
       --qtype) qtype="${2:?}"; shift 2 ;;
+      --protocol-version) protocol_version="${2:?}"; shift 2 ;;
       --timeout) timeout="${2:?}"; shift 2 ;;
       --attempts) attempts="${2:?}"; shift 2 ;;
       --resolver-attempt-cap) resolver_attempt_cap="${2:?}"; shift 2 ;;
@@ -226,6 +233,7 @@ NEXORA_RESOLVERS=${resolvers}
 NEXORA_PORT=${port}
 NEXORA_ZONE=${zone}
 NEXORA_QTYPE=${qtype}
+NEXORA_PROTOCOL_VERSION=${protocol_version}
 NEXORA_TIMEOUT=${timeout}
 NEXORA_ATTEMPTS=${attempts}
 NEXORA_RESOLVER_ATTEMPT_CAP=${resolver_attempt_cap}
