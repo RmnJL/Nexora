@@ -57,6 +57,21 @@ class TestResolverFileFiltering(unittest.TestCase):
         )
         self.assertEqual(got, [])
 
+    def test_accepts_row_when_nxdomain_hijacked_but_tunnel_signals_good(self):
+        row = self._base_row("1.1.1.1")
+        row["nxdomain_correct"] = False
+        data = {"resolvers": [row]}
+        got = _extract_resolvers_from_scan_json(
+            data,
+            min_pass_rate=0.8,
+            max_latency_ms=500.0,
+            min_score=4.0,
+            max_consecutive_failures=1,
+            max_stale_sec=300.0,
+            allowed_pools={"active", "standby"},
+        )
+        self.assertEqual(got, ["1.1.1.1"])
+
     def test_rejects_row_without_protocol_roundtrip(self):
         row = self._base_row("1.1.1.1")
         row["protocol_roundtrip"] = False

@@ -268,10 +268,11 @@ def _extract_resolvers_from_scan_json(
                 continue
             if not bool(row.get("tunnel_realistic", False)):
                 continue
-            if not bool(row.get("nxdomain_correct", False)):
-                continue
             if not bool(row.get("bidirectional", False)):
                 continue
+            # nxdomain_correct is advisory in noisy resolver ecosystems.
+            # Do not hard-drop rows solely for NXDOMAIN hijack behavior when
+            # tunnel-specific signals are healthy.
             # New scanner signal: full sessioned DATA roundtrip.
             # Keep backward compatibility with old reports that don't include it.
             proto_roundtrip = row.get("protocol_roundtrip")

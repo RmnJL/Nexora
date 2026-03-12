@@ -697,13 +697,18 @@ class ScanReport:
 
 
 def _is_working_result(r: ProbeResult) -> bool:
+    """Return True for resolvers usable by forward client path.
+
+    Keep the bar strict enough to require real Nexora bidirectional/sessioned
+    path, but do not gate on stream/nxdomain checks that are often unstable in
+    heterogeneous public resolver pools.
+    """
     return (
         r.reachable
+        and r.random_subdomain
         and r.tunnel_realistic
         and r.bidirectional
         and r.protocol_roundtrip
-        and r.stream_roundtrip
-        and r.nxdomain_correct
     )
 
 
@@ -1463,6 +1468,36 @@ def run_continuous_scan(
                     pass
 
 
+def _flatten_resolver_list_for_client(report: ScanReport) -> list[str]:
+    """Build a stable resolver list for client fallback consumption."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _append(ip: str) -> None:
+        ip = str(ip).strip()
+        if not _is_public_ipv4(ip) or ip in seen:
+            return
+        seen.add(ip)
+        out.append(ip)
+
+    # 1) Ranked rows from scanner publish (best first).
+    for row in report.resolvers:
+        _append(str(row.get("resolver", "")))
+
+    # 2) Pool members if present (active then standby).
+    pools = report.pools if isinstance(report.pools, dict) else {}
+    for ip in pools.get("active", []):
+        _append(ip)
+    for ip in pools.get("standby", []):
+        _append(ip)
+
+    # 3) Final safety net: known fallback resolvers.
+    for ip in _FALLBACK_RESOLVERS:
+        _append(ip)
+
+    return out
+
+
 def write_report(report: ScanReport, output_path: str) -> None:
     """Atomically write scan report to JSON file."""
     out_dir = os.path.dirname(output_path)
@@ -1470,8 +1505,10 @@ def write_report(report: ScanReport, output_path: str) -> None:
         os.makedirs(out_dir, exist_ok=True)
 
     data = asdict(report)
-    # Also write a flat list for easy consumption by the client
-    data["resolver_list"] = [r["resolver"] for r in report.resolvers]
+    # Also write a flat list for easy consumption by the client.
+    # This list remains non-empty even when strict ranked rows are temporarily
+    # sparse, so client resolver-file path stays alive.
+    data["resolver_list"] = _flatten_resolver_list_for_client(report)
 
     fd, tmp_path = tempfile.mkstemp(
         dir=out_dir or ".", suffix=".tmp", prefix=".resolvers-"
@@ -1481,7 +1518,12 @@ def write_report(report: ScanReport, output_path: str) -> None:
             json.dump(data, f, indent=2)
             f.write("\n")
         os.replace(tmp_path, output_path)
-        log.info("wrote %s (%d resolvers)", output_path, len(report.resolvers))
+        log.info(
+            "wrote %s (ranked=%d resolver_list=%d)",
+            output_path,
+            len(report.resolvers),
+            len(data.get("resolver_list", [])),
+        )
     except Exception:
         try:
             os.unlink(tmp_path)
