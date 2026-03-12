@@ -845,6 +845,39 @@ def _payload_with_retry_count(payload: bytes, retry_count: int) -> bytes:
     )
 
 
+def _estimate_query_wall_timeout(timeout: float, attempts: int) -> float:
+    """Estimate worst-case wall time of one _query_txt call.
+
+    This keeps forward-stream wait logic aligned with query behavior under
+    broadcast + serial-fallback modes to avoid premature stream teardown.
+    """
+    base_timeout = max(0.2, float(timeout))
+    rounds = max(1, int(attempts))
+
+    # Upper bound of retry delays (backoff + max jitter) used by _query_txt.
+    retry_delay_budget = 0.0
+    for idx in range(max(0, rounds - 1)):
+        backoff = min(0.6, 0.03 * (2 ** min(4, idx)))
+        retry_delay_budget += backoff * 1.25
+
+    if _resolver_broadcast_enabled and int(_resolver_broadcast_fanout) > 1:
+        # Per round in broadcast mode:
+        #   1) wait up to broadcast budget across parallel resolvers
+        #   2) optional serial fallback query up to `timeout`
+        budget = (
+            float(_resolver_broadcast_timeout)
+            if float(_resolver_broadcast_timeout) > 0
+            else base_timeout
+        )
+        budget = max(0.2, budget)
+        per_round_budget = budget + base_timeout
+        return max(1.0, rounds * per_round_budget + retry_delay_budget + 0.5)
+
+    # Serial mode can spend one extra timeout on final fallback probe.
+    final_fallback_budget = base_timeout if _resolver_last_chance_fallback else 0.0
+    return max(1.0, rounds * base_timeout + final_fallback_budget + retry_delay_budget + 0.5)
+
+
 def _query_pkt_direct(
     server: str,
     port: int,
@@ -1451,6 +1484,8 @@ def _handle_forward_conn(
         ever_received_data = False
         data_in_flight = False  # ensure only 1 data query in flight (ordering)
         session_start = time.time()
+        query_wait_timeout = _estimate_query_wall_timeout(timeout, attempts)
+        consecutive_wait_timeouts = 0
 
         pool = ThreadPoolExecutor(max_workers=max(1, pipeline_depth))
         pending = {}  # {future: (nonce, up_len)}
@@ -1527,13 +1562,28 @@ def _handle_forward_conn(
                 done_set, _ = _futures_wait(
                     pending.keys(),
                     return_when=FIRST_COMPLETED,
-                    timeout=min(
-                        timeout * max(1, attempts) + 3,
-                        max(0.8, timeout + 0.6) if local_closed else (timeout * max(1, attempts) + 3),
+                    timeout=(
+                        max(1.0, min(query_wait_timeout, timeout + 1.5))
+                        if local_closed
+                        else query_wait_timeout
                     ),
                 )
                 if not done_set:
+                    consecutive_wait_timeouts += 1
+                    if consecutive_wait_timeouts <= 1:
+                        log.warning(
+                            "stream wait timeout sid=%d pending=%d wait=%.2fs, retrying",
+                            sid,
+                            len(pending),
+                            (
+                                max(1.0, min(query_wait_timeout, timeout + 1.5))
+                                if local_closed
+                                else query_wait_timeout
+                            ),
+                        )
+                        continue
                     raise TimeoutError("all DNS queries timed out")
+                consecutive_wait_timeouts = 0
 
                 # Fix #4: Accumulate all results before breaking
                 # This prevents losing success metrics when multiple futures complete
@@ -1584,13 +1634,13 @@ def _handle_forward_conn(
 
                     seq, chunk = _extract_seq_chunk(resp.payload)
                     got_new = False
-                    if seq is not None and chunk and seq not in seq_map:
+                    if seq is not None and chunk and seq >= next_seq and seq not in seq_map:
                         seq_map[seq] = chunk
                         got_new = True
 
                     if len(resp.payload) > (1 + 2 + len(chunk if chunk else b"")):
                         for mseq, mchunk in _extract_seq_chunks(resp.payload):
-                            if mseq not in seq_map:
+                            if mseq >= next_seq and mseq not in seq_map:
                                 seq_map[mseq] = mchunk
                                 got_new = True
 
