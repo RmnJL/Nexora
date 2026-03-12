@@ -43,6 +43,17 @@ from nexora_proto import (
     pack_packet,
     unpack_packet,
 )
+from nexora_v2 import (
+    FRAME_S_CLOSE,
+    FRAME_S_DATA,
+    FRAME_S_OPEN,
+    FRAME_S_OPEN_ACK,
+    FRAME_S_RESET,
+    Frame,
+    FrameHeader,
+    pack_envelope,
+    unpack_envelope,
+)
 
 log = logging.getLogger("nexora-server")
 
@@ -127,6 +138,8 @@ class SessionStore:
                 "addr": addr,
                 "ts": time.time(),
                 "stream_sock": None,
+                "v2_mode": False,
+                "v2_streams": {},
                 "down_q": deque(),
                 "down_seq": 1,
                 "resp_cache": {},
@@ -135,6 +148,7 @@ class SessionStore:
 
     def exists(self, sid: int) -> bool:
         stale_sock = None
+        stale_v2_socks = []
         exists_ok = False
         with self._lock:
             item = self._items.get(sid)
@@ -142,6 +156,11 @@ class SessionStore:
                 exists_ok = False
             elif time.time() - float(item.get("ts", 0.0)) > self._session_ttl:
                 stale_sock = item.get("stream_sock")
+                streams = item.get("v2_streams", {})
+                if isinstance(streams, dict):
+                    for entry in streams.values():
+                        if isinstance(entry, dict) and entry.get("sock") is not None:
+                            stale_v2_socks.append(entry["sock"])
                 self._items.pop(sid, None)
                 exists_ok = False
             else:
@@ -151,10 +170,16 @@ class SessionStore:
                 stale_sock.close()
             except Exception:
                 pass
+        for st in stale_v2_socks:
+            try:
+                st.close()
+            except Exception:
+                pass
         return exists_ok
 
     def get(self, sid: int) -> dict | None:
         stale_sock = None
+        stale_v2_socks = []
         out: dict | None = None
         with self._lock:
             item = self._items.get(sid)
@@ -162,6 +187,11 @@ class SessionStore:
                 out = None
             elif time.time() - float(item.get("ts", 0.0)) > self._session_ttl:
                 stale_sock = item.get("stream_sock")
+                streams = item.get("v2_streams", {})
+                if isinstance(streams, dict):
+                    for entry in streams.values():
+                        if isinstance(entry, dict) and entry.get("sock") is not None:
+                            stale_v2_socks.append(entry["sock"])
                 self._items.pop(sid, None)
                 out = None
             else:
@@ -170,6 +200,11 @@ class SessionStore:
         if stale_sock is not None:
             try:
                 stale_sock.close()
+            except Exception:
+                pass
+        for st in stale_v2_socks:
+            try:
+                st.close()
             except Exception:
                 pass
         return out
@@ -183,6 +218,7 @@ class SessionStore:
     def cleanup_expired(self) -> int:
         now = time.time()
         stale_socks = []
+        stale_v2_socks = []
         with self._lock:
             stale_ids = [
                 sid
@@ -193,12 +229,23 @@ class SessionStore:
                 item = self._items.pop(sid, None)
                 if item is not None and item.get("stream_sock") is not None:
                     stale_socks.append(item["stream_sock"])
+                streams = item.get("v2_streams", {}) if item is not None else {}
+                if isinstance(streams, dict):
+                    for entry in streams.values():
+                        if isinstance(entry, dict) and entry.get("sock") is not None:
+                            stale_v2_socks.append(entry["sock"])
         for st in stale_socks:
             try:
                 st.close()
             except Exception:
                 pass
-        return len(stale_socks) if stale_socks else len(stale_ids)
+        for st in stale_v2_socks:
+            try:
+                st.close()
+            except Exception:
+                pass
+        closed_count = len(stale_socks) + len(stale_v2_socks)
+        return closed_count if closed_count else len(stale_ids)
 
 
 def _extract_encoded_chunk(qname: str, zone: str) -> str:
@@ -250,19 +297,255 @@ def _enqueue_downstream(sess: dict, raw: bytes, chunk_size: int = DOWNSTREAM_CHU
     sess["down_seq"] = seq
 
 
+def _v2_close_stream_entry(entry: dict) -> None:
+    st = entry.get("sock")
+    if st is not None:
+        try:
+            st.close()
+        except Exception:
+            pass
+
+
+def _v2_close_all_streams(sess: dict) -> None:
+    streams = sess.get("v2_streams", {})
+    if not isinstance(streams, dict):
+        return
+    for item in streams.values():
+        _v2_close_stream_entry(item)
+    sess["v2_streams"] = {}
+
+
+def _v2_enqueue_stream_down(entry: dict, raw: bytes, chunk_size: int = 80) -> None:
+    if not raw:
+        return
+    q = entry.setdefault("down_q", deque())
+    for i in range(0, len(raw), chunk_size):
+        q.append(raw[i : i + chunk_size])
+
+
+def _v2_read_from_stream(entry: dict) -> bytes:
+    st = entry.get("sock")
+    if st is None:
+        return b""
+    recv_chunks = []
+    recv_total = 0
+    # Keep v2 data payload bounded to fit envelope+DNS budget safely.
+    v2_max = 80
+    for _ in range(STREAM_RECV_ROUNDS):
+        if recv_total >= v2_max:
+            break
+        try:
+            part = st.recv(min(STREAM_RECV_SLICE, v2_max - recv_total))
+            if not part:
+                break
+            recv_chunks.append(part)
+            recv_total += len(part)
+            if len(part) < STREAM_RECV_SLICE:
+                break
+        except socket.timeout:
+            break
+    return b"".join(recv_chunks)
+
+
+def _v2_pack_bounded_response(
+    carrier_id: int,
+    epoch: int,
+    frames: list[Frame],
+    max_payload: int,
+) -> bytes:
+    chosen: list[Frame] = []
+    for fr in frames:
+        trial = chosen + [fr]
+        packed = pack_envelope(carrier_id=carrier_id, epoch=epoch, frames=trial)
+        if len(packed) > max_payload:
+            break
+        chosen.append(fr)
+    return pack_envelope(carrier_id=carrier_id, epoch=epoch, frames=chosen)
+
+
+def _handle_v2_stream_send(
+    sess: dict,
+    packet,
+    qtype: int,
+) -> bytes:
+    if not packet.payload:
+        return pack_envelope(
+            carrier_id=packet.session_id,
+            epoch=int(time.time()) & 0xFFFFFFFF,
+            frames=[],
+        )
+
+    env, in_frames = unpack_envelope(packet.payload)
+    streams: dict[int, dict] = sess.setdefault("v2_streams", {})
+    out_frames: list[Frame] = []
+
+    for fr in in_frames:
+        sid = int(fr.header.stream_id)
+        if sid == 0:
+            continue
+
+        if fr.header.frame_type == FRAME_S_OPEN:
+            try:
+                target = fr.payload.decode("ascii", errors="ignore")
+                host, p = target.rsplit(":", 1)
+                tport = int(p)
+                stream_sock = socket.create_connection((host, tport), timeout=1.5)
+                stream_sock.settimeout(STREAM_SOCK_TIMEOUT)
+                old = streams.get(sid)
+                if old is not None:
+                    _v2_close_stream_entry(old)
+                streams[sid] = {
+                    "sock": stream_sock,
+                    "tx_seq": 1,
+                    "down_q": deque(),
+                }
+                out_frames.append(
+                    Frame(
+                        header=FrameHeader(
+                            frame_type=FRAME_S_OPEN_ACK,
+                            frame_flags=0,
+                            stream_id=sid,
+                            seq=fr.header.seq,
+                            ack_base=0,
+                            ack_bitmap16=0,
+                            window=64,
+                            payload_len=2,
+                        ),
+                        payload=b"OK",
+                    )
+                )
+            except Exception:
+                out_frames.append(
+                    Frame(
+                        header=FrameHeader(
+                            frame_type=FRAME_S_RESET,
+                            frame_flags=0,
+                            stream_id=sid,
+                            seq=fr.header.seq,
+                            ack_base=0,
+                            ack_bitmap16=0,
+                            window=0,
+                            payload_len=2,
+                        ),
+                        payload=b"ER",
+                    )
+                )
+            continue
+
+        if fr.header.frame_type == FRAME_S_CLOSE:
+            old = streams.pop(sid, None)
+            if old is not None:
+                _v2_close_stream_entry(old)
+            out_frames.append(
+                Frame(
+                    header=FrameHeader(
+                        frame_type=FRAME_S_CLOSE,
+                        frame_flags=0,
+                        stream_id=sid,
+                        seq=fr.header.seq,
+                        ack_base=0,
+                        ack_bitmap16=0,
+                        window=0,
+                        payload_len=1,
+                    ),
+                    payload=b"K",
+                )
+            )
+            continue
+
+        if fr.header.frame_type == FRAME_S_DATA:
+            entry = streams.get(sid)
+            if entry is None or entry.get("sock") is None:
+                out_frames.append(
+                    Frame(
+                        header=FrameHeader(
+                            frame_type=FRAME_S_RESET,
+                            frame_flags=0,
+                            stream_id=sid,
+                            seq=fr.header.seq,
+                            ack_base=0,
+                            ack_bitmap16=0,
+                            window=0,
+                            payload_len=2,
+                        ),
+                        payload=b"NS",
+                    )
+                )
+                continue
+
+            st = entry["sock"]
+            try:
+                if fr.payload:
+                    st.sendall(fr.payload)
+                recv_data = _v2_read_from_stream(entry)
+                _v2_enqueue_stream_down(entry, recv_data)
+                q = entry.get("down_q", deque())
+                down = q.popleft() if q else b""
+                if down:
+                    tx_seq = int(entry.get("tx_seq", 1))
+                    entry["tx_seq"] = tx_seq + 1
+                    out_frames.append(
+                        Frame(
+                            header=FrameHeader(
+                                frame_type=FRAME_S_DATA,
+                                frame_flags=0,
+                                stream_id=sid,
+                                seq=tx_seq,
+                                ack_base=fr.header.seq,
+                                ack_bitmap16=0,
+                                window=64,
+                                payload_len=len(down),
+                            ),
+                            payload=down,
+                        )
+                    )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                _v2_close_stream_entry(entry)
+                streams.pop(sid, None)
+                out_frames.append(
+                    Frame(
+                        header=FrameHeader(
+                            frame_type=FRAME_S_RESET,
+                            frame_flags=0,
+                            stream_id=sid,
+                            seq=fr.header.seq,
+                            ack_base=0,
+                            ack_bitmap16=0,
+                            window=0,
+                            payload_len=2,
+                        ),
+                        payload=b"IO",
+                    )
+                )
+
+    max_payload = 140 if qtype == TYPE_TXT else 120
+    return _v2_pack_bounded_response(
+        carrier_id=packet.session_id,
+        epoch=env.epoch,
+        frames=out_frames,
+        max_payload=max_payload,
+    )
+
+
 def run_server(
     bind: str,
     port: int,
     zone: str,
     session_ttl: float = 900.0,
     cleanup_interval: float = 60.0,
+    protocol_version: int = 1,
 ) -> None:
     sessions = SessionStore(session_ttl=session_ttl)
     hello_limiter = _HelloRateLimiter()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((bind, port))
     log.info(
-        "listening on %s:%d zone=%s session_ttl=%ss", bind, port, zone, session_ttl
+        "listening on %s:%d zone=%s session_ttl=%ss protocol=v%d",
+        bind,
+        port,
+        zone,
+        session_ttl,
+        int(protocol_version),
     )
     last_cleanup = time.time()
 
@@ -353,6 +636,27 @@ def run_server(
                 # payload format: b"host:port"
                 try:
                     target = packet.payload.decode("ascii", errors="ignore")
+                    if int(protocol_version) == 2 and target.lower().startswith("v2-carrier"):
+                        old = sess.get("stream_sock")
+                        if old is not None:
+                            try:
+                                old.close()
+                            except Exception:
+                                pass
+                        _v2_close_all_streams(sess)
+                        sess["stream_sock"] = None
+                        sess["down_q"] = deque()
+                        sess["down_seq"] = 1
+                        sess["v2_mode"] = True
+                        sess["v2_streams"] = {}
+                        ack = pack_packet(
+                            TYPE_STREAM_OPEN_ACK, packet.session_id, packet.nonce, b"OK"
+                        )
+                        log.info("stream v2 carrier open session=%d", packet.session_id)
+                        _cache_put(sess, TYPE_STREAM_OPEN, packet.nonce, ack)
+                        sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+                        continue
+
                     host, p = target.rsplit(":", 1)
                     tport = int(p)
                     stream_sock = socket.create_connection((host, tport), timeout=1.5)
@@ -365,6 +669,8 @@ def run_server(
                         except Exception:
                             pass
                     sess["stream_sock"] = stream_sock
+                    sess["v2_mode"] = False
+                    _v2_close_all_streams(sess)
                     sess["down_q"] = deque()
                     sess["down_seq"] = 1
                     ack = pack_packet(
@@ -389,9 +695,41 @@ def run_server(
 
             if packet.msg_type == TYPE_STREAM_SEND and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
-                if sess is None or sess.get("stream_sock") is None:
+                if sess is None:
+                    sock.sendto(build_noerror_empty(data), addr)
+                    continue
+                sessions.touch(packet.session_id)
+                if packet.retry_count > 0:
+                    log.debug(
+                        "stream send retry sid=%d nonce=%d retry=%d payload=%d",
+                        packet.session_id,
+                        packet.nonce,
+                        packet.retry_count,
+                        len(packet.payload),
+                    )
+                cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
+                if cached is not None:
+                    sock.sendto(_make_dns_answer(data, qtype, cached), addr)
+                    continue
+
+                if sess.get("v2_mode"):
+                    try:
+                        out_payload = _handle_v2_stream_send(sess, packet, qtype)
+                        ack = pack_packet(
+                            TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload
+                        )
+                    except Exception as e:
+                        log.warning("stream v2 send error session=%d: %s", packet.session_id, e)
+                        ack = pack_packet(
+                            TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
+                        )
+                    _cache_put(sess, TYPE_STREAM_SEND, packet.nonce, ack)
+                    sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+                    continue
+
+                if sess.get("stream_sock") is None:
                     # Drain any remaining downstream data first
-                    q = sess.get("down_q", deque()) if sess else deque()
+                    q = sess.get("down_q", deque())
                     if q:
                         max_payload = 140 if qtype == TYPE_TXT else 120
                         out_payload = b""
@@ -409,19 +747,6 @@ def run_server(
                         log.debug("stream_send: session %d backend dead, signalling close", packet.session_id)
                         ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"")
                     sock.sendto(_make_dns_answer(data, qtype, ack), addr)
-                    continue
-                sessions.touch(packet.session_id)
-                if packet.retry_count > 0:
-                    log.debug(
-                        "stream send retry sid=%d nonce=%d retry=%d payload=%d",
-                        packet.session_id,
-                        packet.nonce,
-                        packet.retry_count,
-                        len(packet.payload),
-                    )
-                cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
-                if cached is not None:
-                    sock.sendto(_make_dns_answer(data, qtype, cached), addr)
                     continue
                 st = sess["stream_sock"]
                 try:
@@ -481,13 +806,17 @@ def run_server(
 
             if packet.msg_type == TYPE_STREAM_CLOSE and sessions.exists(packet.session_id):
                 sess = sessions.get(packet.session_id)
-                if sess is not None and sess.get("stream_sock") is not None:
-                    try:
-                        sess["stream_sock"].close()
-                    except Exception:
-                        pass
-                    sess["stream_sock"] = None
-                    sess["down_q"] = deque()
+                if sess is not None:
+                    if sess.get("stream_sock") is not None:
+                        try:
+                            sess["stream_sock"].close()
+                        except Exception:
+                            pass
+                        sess["stream_sock"] = None
+                        sess["down_q"] = deque()
+                    if sess.get("v2_mode"):
+                        _v2_close_all_streams(sess)
+                        sess["v2_mode"] = False
                 ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"K")
                 if sess is not None:
                     sessions.touch(packet.session_id)
@@ -519,7 +848,7 @@ def main() -> None:
         type=int,
         choices=[1, 2],
         default=1,
-        help="protocol version selector (v2 uses scaffold mode in this phase)",
+        help="protocol version selector (v2 enables MVP stream envelope path)",
     )
     p.add_argument(
         "--log-level",
@@ -547,8 +876,8 @@ def main() -> None:
     if int(args.protocol_version) == 2:
         log.warning(
             (
-                "protocol v2 scaffold enabled on server: v1 DNS handler remains "
-                "active while v2 data-path integration is in progress"
+                "protocol v2 enabled on server: stream path accepts v2 carrier "
+                "sessions over TYPE_STREAM_SEND envelopes"
             )
         )
     run_server(
@@ -557,6 +886,7 @@ def main() -> None:
         args.zone,
         session_ttl=args.session_ttl,
         cleanup_interval=args.cleanup_interval,
+        protocol_version=args.protocol_version,
     )
 
 

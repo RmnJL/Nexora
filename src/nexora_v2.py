@@ -24,6 +24,25 @@ V2_VERSION = 2
 _ENV_HDR = struct.Struct(">2sBBIIBBH")
 _FRAME_HDR = struct.Struct(">BBIIIHHH")
 
+# Carrier control
+FRAME_C_HELLO = 0x01
+FRAME_C_HELLO_ACK = 0x02
+FRAME_C_PING = 0x03
+FRAME_C_PONG = 0x04
+FRAME_C_GOAWAY = 0x05
+
+# Stream control
+FRAME_S_OPEN = 0x10
+FRAME_S_OPEN_ACK = 0x11
+FRAME_S_CLOSE = 0x12
+FRAME_S_RESET = 0x13
+
+# Stream data
+FRAME_S_DATA = 0x20
+FRAME_S_DATA_ACK = 0x21
+FRAME_S_RETX_HINT = 0x22
+FRAME_S_WINDOW_UPDATE = 0x23
+
 
 @dataclass(frozen=True)
 class EnvelopeHeader:
@@ -45,6 +64,12 @@ class FrameHeader:
     ack_bitmap16: int
     window: int
     payload_len: int
+
+
+@dataclass(frozen=True)
+class Frame:
+    header: FrameHeader
+    payload: bytes
 
 
 def pack_envelope_header(h: EnvelopeHeader) -> bytes:
@@ -109,6 +134,50 @@ def unpack_frame_header(raw: bytes) -> FrameHeader:
         window=window,
         payload_len=payload_len,
     )
+
+
+def pack_envelope(
+    carrier_id: int,
+    epoch: int,
+    frames: list[Frame],
+    flags: int = 0,
+) -> bytes:
+    body = b""
+    for frame in frames:
+        if len(frame.payload) != int(frame.header.payload_len):
+            raise ValueError("frame payload length mismatch")
+        body += pack_frame_header(frame.header) + frame.payload
+    h = EnvelopeHeader(
+        flags=flags,
+        carrier_id=carrier_id,
+        epoch=epoch,
+        frame_count=len(frames),
+        reserved=0,
+        envelope_len=len(body),
+    )
+    return pack_envelope_header(h) + body
+
+
+def unpack_envelope(raw: bytes) -> tuple[EnvelopeHeader, list[Frame]]:
+    eh = unpack_envelope_header(raw)
+    start = _ENV_HDR.size
+    end = start + int(eh.envelope_len)
+    if len(raw) < end:
+        raise ValueError("v2 envelope truncated")
+    payload = raw[start:end]
+    frames: list[Frame] = []
+    offset = 0
+    for _ in range(int(eh.frame_count)):
+        if offset + _FRAME_HDR.size > len(payload):
+            raise ValueError("v2 frame header truncated")
+        fh = unpack_frame_header(payload[offset : offset + _FRAME_HDR.size])
+        offset += _FRAME_HDR.size
+        if offset + int(fh.payload_len) > len(payload):
+            raise ValueError("v2 frame payload truncated")
+        fp = payload[offset : offset + int(fh.payload_len)]
+        offset += int(fh.payload_len)
+        frames.append(Frame(header=fh, payload=fp))
+    return eh, frames
 
 
 class CarrierState(str, Enum):

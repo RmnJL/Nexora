@@ -43,7 +43,19 @@ from nexora_proto import (
     random_nonce,
     unpack_packet,
 )
-from nexora_v2 import CarrierManager, StreamMux
+from nexora_v2 import (
+    FRAME_S_CLOSE,
+    FRAME_S_DATA,
+    FRAME_S_OPEN,
+    FRAME_S_OPEN_ACK,
+    FRAME_S_RESET,
+    CarrierManager,
+    Frame,
+    FrameHeader,
+    StreamMux,
+    pack_envelope,
+    unpack_envelope,
+)
 
 log = logging.getLogger("nexora-client")
 
@@ -1381,6 +1393,331 @@ def _stream_close(
         return
 
 
+def _v2_query_frames(
+    sid: int,
+    frames: list[Frame],
+    selector: ResolverSelector,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+) -> list[Frame]:
+    n = random_nonce()
+    env = pack_envelope(
+        carrier_id=sid,
+        epoch=int(time.time()) & 0xFFFFFFFF,
+        frames=frames,
+    )
+    pkt = pack_packet(TYPE_STREAM_SEND, sid, n, env)
+    _, rp = _query_txt(selector, port, zone, timeout, pkt, attempts, qtype)
+    if rp.msg_type != TYPE_STREAM_RECV or rp.nonce != n:
+        raise RuntimeError("v2 stream recv mismatch")
+    if not rp.payload:
+        return []
+    _, out_frames = unpack_envelope(rp.payload)
+    return out_frames
+
+
+def _v2_open_stream(
+    sid: int,
+    stream_id: int,
+    target_host: str,
+    target_port: int,
+    selector: ResolverSelector,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+) -> None:
+    target = f"{target_host}:{target_port}".encode("ascii")
+    frames = [
+        Frame(
+            header=FrameHeader(
+                frame_type=FRAME_S_OPEN,
+                frame_flags=0,
+                stream_id=stream_id,
+                seq=1,
+                ack_base=0,
+                ack_bitmap16=0,
+                window=0,
+                payload_len=len(target),
+            ),
+            payload=target,
+        )
+    ]
+    out = _v2_query_frames(
+        sid, frames, selector, port, zone, timeout, attempts, qtype
+    )
+    for fr in out:
+        if fr.header.stream_id != stream_id:
+            continue
+        if fr.header.frame_type == FRAME_S_OPEN_ACK and fr.payload.startswith(b"OK"):
+            return
+        if fr.header.frame_type == FRAME_S_RESET:
+            raise RuntimeError(f"v2 stream reset on open: {fr.payload!r}")
+    raise RuntimeError("v2 stream open failed")
+
+
+def _v2_xfer(
+    sid: int,
+    stream_id: int,
+    seq: int,
+    outbound: bytes,
+    selector: ResolverSelector,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+) -> tuple[int, bytes, bool]:
+    frames = [
+        Frame(
+            header=FrameHeader(
+                frame_type=FRAME_S_DATA,
+                frame_flags=0,
+                stream_id=stream_id,
+                seq=seq,
+                ack_base=0,
+                ack_bitmap16=0,
+                window=0,
+                payload_len=len(outbound),
+            ),
+            payload=outbound,
+        )
+    ]
+    out = _v2_query_frames(
+        sid, frames, selector, port, zone, timeout, attempts, qtype
+    )
+    down = b""
+    remote_closed = False
+    for fr in out:
+        if fr.header.stream_id != stream_id:
+            continue
+        if fr.header.frame_type == FRAME_S_DATA and fr.payload:
+            down += fr.payload
+        elif fr.header.frame_type in (FRAME_S_CLOSE, FRAME_S_RESET):
+            remote_closed = True
+    return seq + 1, down, remote_closed
+
+
+def _v2_close_stream(
+    sid: int,
+    stream_id: int,
+    selector: ResolverSelector,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+) -> None:
+    frames = [
+        Frame(
+            header=FrameHeader(
+                frame_type=FRAME_S_CLOSE,
+                frame_flags=0,
+                stream_id=stream_id,
+                seq=0,
+                ack_base=0,
+                ack_bitmap16=0,
+                window=0,
+                payload_len=0,
+            ),
+            payload=b"",
+        )
+    ]
+    try:
+        _v2_query_frames(sid, frames, selector, port, zone, timeout, attempts, qtype)
+    except Exception:
+        return
+
+
+def _handle_forward_conn_v2(
+    local_conn: socket.socket,
+    client_addr: tuple[str, int],
+    selector: ResolverSelector,
+    port: int,
+    zone: str,
+    timeout: float,
+    attempts: int,
+    qtype: int,
+    target_host: str,
+    target_port: int,
+    chunk_size: int,
+    stream_open_retries: int,
+    poll_min_interval: float,
+    poll_max_interval: float,
+    idle_timeout: float,
+    zombie_grace_sec: float,
+) -> None:
+    sid = None
+    stream_id = 1
+    seq = 1
+    try:
+        local_conn.settimeout(0.05)
+        local_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        try:
+            local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+            local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+            local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except (AttributeError, OSError):
+            pass
+
+        # Reuse existing session bootstrap and mark it as v2 carrier on server.
+        sid = _establish_session(selector, port, zone, timeout, attempts, qtype)
+        _stream_open(
+            sid,
+            selector,
+            port,
+            zone,
+            timeout,
+            attempts,
+            qtype,
+            "v2-carrier",
+            0,
+            open_retries=max(1, stream_open_retries),
+        )
+        _v2_open_stream(
+            sid,
+            stream_id,
+            target_host,
+            target_port,
+            selector,
+            port,
+            zone,
+            timeout,
+            attempts,
+            qtype,
+        )
+        log.info(
+            "forward v2 open local=%s:%d sid=%d stream=%d target=%s:%d",
+            client_addr[0],
+            client_addr[1],
+            sid,
+            stream_id,
+            target_host,
+            target_port,
+        )
+
+        local_closed = False
+        local_close_ts: float | None = None
+        last_activity = time.time()
+        session_start = time.time()
+        ever_received_data = False
+        poll_wait = max(0.02, poll_min_interval)
+        poll_ceiling = max(poll_wait, poll_max_interval)
+        next_pull_at = time.time()
+        idle_rounds = 0
+
+        while True:
+            now = time.time()
+            if idle_timeout > 0 and now - last_activity >= idle_timeout:
+                break
+            if local_closed and local_close_ts is not None and now - local_close_ts >= 1.5:
+                break
+            if (
+                zombie_grace_sec > 0
+                and not ever_received_data
+                and now - session_start >= zombie_grace_sec
+            ):
+                log.info(
+                    "forward v2 zombie sid=%d stream=%d: no downstream after %.1fs (grace=%.1fs)",
+                    sid,
+                    stream_id,
+                    now - session_start,
+                    zombie_grace_sec,
+                )
+                break
+
+            outbound = b""
+            if not local_closed:
+                try:
+                    outbound = local_conn.recv(chunk_size)
+                    if outbound == b"":
+                        local_closed = True
+                        local_close_ts = time.time()
+                        log.info("forward v2 local closed sid=%d stream=%d (clean FIN)", sid, stream_id)
+                        outbound = b""
+                except socket.timeout:
+                    outbound = b""
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    local_closed = True
+                    local_close_ts = time.time()
+                    outbound = b""
+                    log.info("forward v2 local closed sid=%d stream=%d (connection reset)", sid, stream_id)
+
+            now2 = time.time()
+            should_poll = bool(outbound) or now2 >= next_pull_at
+            if not should_poll:
+                time.sleep(min(0.05, max(0.0, next_pull_at - now2)))
+                continue
+
+            seq, down, remote_closed = _v2_xfer(
+                sid,
+                stream_id,
+                seq,
+                outbound,
+                selector,
+                port,
+                zone,
+                timeout,
+                attempts,
+                qtype,
+            )
+            log.info(
+                "stream v2 xfer sid=%d stream=%d up=%d down=%d",
+                sid,
+                stream_id,
+                len(outbound),
+                len(down),
+            )
+
+            if down:
+                try:
+                    local_conn.sendall(down)
+                    ever_received_data = True
+                    last_activity = time.time()
+                    idle_rounds = 0
+                    poll_wait = max(0.02, poll_min_interval)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    local_closed = True
+                    local_close_ts = time.time()
+            elif outbound:
+                last_activity = time.time()
+                idle_rounds = 0
+                poll_wait = max(0.02, poll_min_interval)
+            else:
+                idle_rounds += 1
+                poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
+
+            next_pull_at = time.time() + poll_wait
+
+            if remote_closed:
+                log.info("forward v2 remote closed sid=%d stream=%d", sid, stream_id)
+                break
+            if local_closed and idle_rounds >= 1:
+                break
+
+    except TimeoutError as e:
+        log.warning("forward timeout %s sid=%s: %s", client_addr, sid, e)
+    except (BrokenPipeError, ConnectionResetError) as e:
+        log.info("forward pipe closed %s sid=%s: %s", client_addr, sid, e)
+    except OSError as e:
+        log.warning("forward os-error %s sid=%s: %s", client_addr, sid, e)
+    except Exception as e:
+        log.warning("forward error %s sid=%s: %s", client_addr, sid, e)
+    finally:
+        if sid is not None:
+            _v2_close_stream(sid, stream_id, selector, port, zone, max(0.8, timeout), 1, qtype)
+            close_timeout = max(0.5, min(1.0, timeout * 0.5))
+            _stream_close(sid, selector, port, zone, close_timeout, 1, qtype)
+        try:
+            local_conn.close()
+        except Exception:
+            pass
+
+
 def _extract_seq_chunk(payload: bytes) -> tuple[int | None, bytes]:
     """Extract a single (seq, chunk) from length-prefixed format: [1B len][2B seq][data]."""
     if len(payload) < 3:
@@ -1432,7 +1769,28 @@ def _handle_forward_conn(
     idle_timeout: float,
     zombie_grace_sec: float,
     pipeline_depth: int = 1,
+    protocol_version: int = 1,
 ) -> None:
+    if int(protocol_version) == 2:
+        return _handle_forward_conn_v2(
+            local_conn,
+            client_addr,
+            selector,
+            port,
+            zone,
+            timeout,
+            attempts,
+            qtype,
+            target_host,
+            target_port,
+            chunk_size,
+            stream_open_retries,
+            poll_min_interval,
+            poll_max_interval,
+            idle_timeout,
+            zombie_grace_sec,
+        )
+
     sid = None
     try:
         local_conn.settimeout(0.05)
@@ -1735,15 +2093,16 @@ def run_forward_server(
     idle_timeout: float,
     zombie_grace_sec: float,
     pipeline_depth: int = 1,
+    protocol_version: int = 1,
 ) -> None:
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsock.bind((listen_host, listen_port))
     lsock.listen(256)
     log.info(
-        "forward server listening on %s:%d -> %s:%d via resolvers=%s:%d",
+        "forward server listening on %s:%d -> %s:%d via resolvers=%s:%d protocol=v%d",
         listen_host, listen_port, target_host, target_port,
-        ','.join(selector.servers), port,
+        ','.join(selector.servers), port, int(protocol_version),
     )
     sem = threading.BoundedSemaphore(max(1, max_conns))
     ip_counts: dict[str, int] = {}
@@ -1813,6 +2172,7 @@ def run_forward_server(
                     idle_timeout,
                     zombie_grace_sec,
                     pipeline_depth,
+                    protocol_version,
                 )
             finally:
                 _runtime_kpi.stream_close()
@@ -1928,7 +2288,7 @@ def main() -> None:
         type=int,
         choices=[1, 2],
         default=1,
-        help="protocol version selector (v2 is scaffold mode in this phase)",
+        help="protocol version selector (v2 enables MVP stream envelope path)",
     )
     p.add_argument("--tcp-test-host", default="")
     p.add_argument("--tcp-test-port", type=int, default=80)
@@ -2145,8 +2505,8 @@ def main() -> None:
     if int(args.protocol_version) == 2:
         log.warning(
             (
-                "protocol v2 scaffold enabled: carrier control-plane is active, "
-                "data-plane still uses v1 stream path"
+                "protocol v2 enabled: forward path uses v2 stream envelopes "
+                "over a v2 carrier session"
             )
         )
         try:
@@ -2157,14 +2517,14 @@ def main() -> None:
             carriers = carrier_mgr.bootstrap()
             mux = StreamMux()
             log.info(
-                "v2 scaffold bootstrap epoch=%d carriers=%d ids=%s streams=%d",
+                "v2 bootstrap epoch=%d carriers=%d ids=%s streams=%d",
                 carrier_mgr.epoch,
                 len(carriers),
                 ",".join(str(c.carrier_id) for c in carriers),
                 mux.active_count(),
             )
         except Exception as e:
-            raise RuntimeError(f"v2 scaffold bootstrap failed: {e}")
+            raise RuntimeError(f"v2 bootstrap failed: {e}")
 
     selector = ResolverSelector(
         resolver_list,
@@ -2309,6 +2669,7 @@ def main() -> None:
             args.forward_idle_timeout,
             args.forward_zombie_grace_sec,
             args.pipeline_depth,
+            args.protocol_version,
         )
     elif args.tcp_test_host:
         run_tcp_test(
