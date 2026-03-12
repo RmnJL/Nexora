@@ -24,9 +24,17 @@ Environment="NEXORA_RESOLVER_SWITCH_INTERVAL=180"
 Environment="NEXORA_RESOLVER_PROBE_TIMEOUT=1.4"
 Environment="NEXORA_RESOLVER_PROBE_QTYPE=TXT"
 Environment="NEXORA_RESOLVER_MAX_INFLIGHT=1"
+Environment="NEXORA_RESOLVER_BROADCAST_FLAG="
+Environment="NEXORA_RESOLVER_BROADCAST_FANOUT=10"
+Environment="NEXORA_RESOLVER_BROADCAST_TIMEOUT=0"
+Environment="NEXORA_RESOLVER_BROADCAST_PER_RESOLVER_TIMEOUT=0"
+Environment="NEXORA_KPI_SUMMARY_INTERVAL=60"
 Environment="NEXORA_RESOLVER_FILE_MIN_PASS_RATE=0.55"
 Environment="NEXORA_RESOLVER_FILE_MAX_LATENCY_MS=750"
 Environment="NEXORA_RESOLVER_FILE_MIN_SCORE=4.0"
+Environment="NEXORA_RESOLVER_FILE_MAX_CONSECUTIVE_FAILURES=1"
+Environment="NEXORA_RESOLVER_FILE_MAX_STALE_SEC=240"
+Environment="NEXORA_RESOLVER_FILE_POOLS=active,standby,fallback"
 Environment="NEXORA_TCP_CHUNK_SIZE=100"
 Environment="NEXORA_FORWARD_LISTEN_HOST=0.0.0.0"
 Environment="NEXORA_FORWARD_LISTEN_PORT=1443"
@@ -41,10 +49,11 @@ Environment="NEXORA_RESOLVER_FILE=/etc/nexora/resolvers.json"
 Environment="NEXORA_FORWARD_POLL_MIN_INTERVAL=0.12"
 Environment="NEXORA_FORWARD_POLL_MAX_INTERVAL=3.0"
 Environment="NEXORA_FORWARD_IDLE_TIMEOUT=12"
+Environment="NEXORA_FORWARD_ZOMBIE_GRACE_SEC=8.0"
 # Optional runtime overrides written by easy-run.sh.
 # Keep this AFTER default Environment lines so /etc/default values can override.
 EnvironmentFile=-/etc/default/nexora-client-forward
-ExecStart=/usr/bin/python3 -u ${NEXORA_CLIENT_PY} --server ${NEXORA_RESOLVERS} --port ${NEXORA_PORT} --zone ${NEXORA_ZONE} --qtype ${NEXORA_QTYPE} --timeout ${NEXORA_TIMEOUT} --attempts ${NEXORA_ATTEMPTS} --resolver-attempt-cap ${NEXORA_RESOLVER_ATTEMPT_CAP} --resolver-fail-cooldown ${NEXORA_RESOLVER_FAIL_COOLDOWN} --resolver-max-inflight ${NEXORA_RESOLVER_MAX_INFLIGHT} --resolver-health-interval ${NEXORA_RESOLVER_HEALTH_INTERVAL} --resolver-switch-interval ${NEXORA_RESOLVER_SWITCH_INTERVAL} --resolver-probe-timeout ${NEXORA_RESOLVER_PROBE_TIMEOUT} --resolver-probe-qtype ${NEXORA_RESOLVER_PROBE_QTYPE} --resolver-file-min-pass-rate ${NEXORA_RESOLVER_FILE_MIN_PASS_RATE} --resolver-file-max-latency-ms ${NEXORA_RESOLVER_FILE_MAX_LATENCY_MS} --resolver-file-min-score ${NEXORA_RESOLVER_FILE_MIN_SCORE} --tcp-chunk-size ${NEXORA_TCP_CHUNK_SIZE} --forward-listen-host ${NEXORA_FORWARD_LISTEN_HOST} --forward-listen-port ${NEXORA_FORWARD_LISTEN_PORT} --forward-target-host ${NEXORA_FORWARD_TARGET_HOST} --forward-target-port ${NEXORA_FORWARD_TARGET_PORT} --forward-max-conns ${NEXORA_FORWARD_MAX_CONNS} --forward-max-conns-per-ip ${NEXORA_FORWARD_MAX_CONNS_PER_IP} --stream-open-retries ${NEXORA_STREAM_OPEN_RETRIES} --dns-query-interval ${NEXORA_DNS_QUERY_INTERVAL} --forward-poll-min-interval ${NEXORA_FORWARD_POLL_MIN_INTERVAL} --forward-poll-max-interval ${NEXORA_FORWARD_POLL_MAX_INTERVAL} --forward-idle-timeout ${NEXORA_FORWARD_IDLE_TIMEOUT} --pipeline-depth ${NEXORA_PIPELINE_DEPTH} --resolver-file ${NEXORA_RESOLVER_FILE}
+ExecStart=/usr/bin/python3 -u ${NEXORA_CLIENT_PY} --server ${NEXORA_RESOLVERS} --port ${NEXORA_PORT} --zone ${NEXORA_ZONE} --qtype ${NEXORA_QTYPE} --timeout ${NEXORA_TIMEOUT} --attempts ${NEXORA_ATTEMPTS} --resolver-attempt-cap ${NEXORA_RESOLVER_ATTEMPT_CAP} --resolver-fail-cooldown ${NEXORA_RESOLVER_FAIL_COOLDOWN} --resolver-max-inflight ${NEXORA_RESOLVER_MAX_INFLIGHT} ${NEXORA_RESOLVER_BROADCAST_FLAG} --resolver-broadcast-fanout ${NEXORA_RESOLVER_BROADCAST_FANOUT} --resolver-broadcast-timeout ${NEXORA_RESOLVER_BROADCAST_TIMEOUT} --resolver-broadcast-per-resolver-timeout ${NEXORA_RESOLVER_BROADCAST_PER_RESOLVER_TIMEOUT} --kpi-summary-interval ${NEXORA_KPI_SUMMARY_INTERVAL} --resolver-health-interval ${NEXORA_RESOLVER_HEALTH_INTERVAL} --resolver-switch-interval ${NEXORA_RESOLVER_SWITCH_INTERVAL} --resolver-probe-timeout ${NEXORA_RESOLVER_PROBE_TIMEOUT} --resolver-probe-qtype ${NEXORA_RESOLVER_PROBE_QTYPE} --resolver-file-min-pass-rate ${NEXORA_RESOLVER_FILE_MIN_PASS_RATE} --resolver-file-max-latency-ms ${NEXORA_RESOLVER_FILE_MAX_LATENCY_MS} --resolver-file-min-score ${NEXORA_RESOLVER_FILE_MIN_SCORE} --resolver-file-max-consecutive-failures ${NEXORA_RESOLVER_FILE_MAX_CONSECUTIVE_FAILURES} --resolver-file-max-stale-sec ${NEXORA_RESOLVER_FILE_MAX_STALE_SEC} --resolver-file-pools ${NEXORA_RESOLVER_FILE_POOLS} --tcp-chunk-size ${NEXORA_TCP_CHUNK_SIZE} --forward-listen-host ${NEXORA_FORWARD_LISTEN_HOST} --forward-listen-port ${NEXORA_FORWARD_LISTEN_PORT} --forward-target-host ${NEXORA_FORWARD_TARGET_HOST} --forward-target-port ${NEXORA_FORWARD_TARGET_PORT} --forward-max-conns ${NEXORA_FORWARD_MAX_CONNS} --forward-max-conns-per-ip ${NEXORA_FORWARD_MAX_CONNS_PER_IP} --stream-open-retries ${NEXORA_STREAM_OPEN_RETRIES} --dns-query-interval ${NEXORA_DNS_QUERY_INTERVAL} --forward-poll-min-interval ${NEXORA_FORWARD_POLL_MIN_INTERVAL} --forward-poll-max-interval ${NEXORA_FORWARD_POLL_MAX_INTERVAL} --forward-idle-timeout ${NEXORA_FORWARD_IDLE_TIMEOUT} --forward-zombie-grace-sec ${NEXORA_FORWARD_ZOMBIE_GRACE_SEC} --pipeline-depth ${NEXORA_PIPELINE_DEPTH} --resolver-file ${NEXORA_RESOLVER_FILE}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535

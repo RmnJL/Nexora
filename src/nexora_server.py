@@ -319,6 +319,13 @@ def run_server(
                     sock.sendto(build_noerror_empty(data), addr)
                     continue
                 sessions.touch(packet.session_id)
+                if packet.retry_count > 0:
+                    log.debug(
+                        "data retry sid=%d nonce=%d retry=%d",
+                        packet.session_id,
+                        packet.nonce,
+                        packet.retry_count,
+                    )
                 cached = _cache_get(sess, TYPE_DATA, packet.nonce)
                 if cached is not None:
                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
@@ -404,6 +411,14 @@ def run_server(
                     sock.sendto(_make_dns_answer(data, qtype, ack), addr)
                     continue
                 sessions.touch(packet.session_id)
+                if packet.retry_count > 0:
+                    log.debug(
+                        "stream send retry sid=%d nonce=%d retry=%d payload=%d",
+                        packet.session_id,
+                        packet.nonce,
+                        packet.retry_count,
+                        len(packet.payload),
+                    )
                 cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
                 if cached is not None:
                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)

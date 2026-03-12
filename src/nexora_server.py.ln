@@ -1,0 +1,535 @@
+1: """
+2: Nexora phase-1 server:
+3: - UDP/53 DNS loop
+4: - HELLO/HELLO_ACK session init
+5: Signature: Rmn JL
+6: """
+7: 
+8: from __future__ import annotations
+9: 
+10: import argparse
+11: import binascii
+12: import logging
+13: import secrets
+14: import socket
+15: import threading
+16: import time
+17: from collections import deque
+18: 
+19: from dns_wire import (
+20:     TYPE_A,
+21:     TYPE_NS,
+22:     TYPE_SOA,
+23:     TYPE_TXT,
+24:     build_cname_answer,
+25:     build_noerror_empty,
+26:     build_ns_answer,
+27:     build_soa_answer,
+28:     build_txt_answer,
+29:     parse_query,
+30: )
+31: from nexora_proto import (
+32:     TYPE_DATA,
+33:     TYPE_DATA_ACK,
+34:     TYPE_HELLO,
+35:     TYPE_HELLO_ACK,
+36:     TYPE_STREAM_CLOSE,
+37:     TYPE_STREAM_OPEN,
+38:     TYPE_STREAM_OPEN_ACK,
+39:     TYPE_STREAM_RECV,
+40:     TYPE_STREAM_SEND,
+41:     decode_dns_data,
+42:     encode_dns_data,
+43:     pack_packet,
+44:     unpack_packet,
+45: )
+46: 
+47: log = logging.getLogger("nexora-server")
+48: 
+49: # Single-threaded server: keep recv timeout minimal.  The backend is on
+50: # localhost so data arrives in <1 ms; 10 ms catches everything.
+51: STREAM_SOCK_TIMEOUT = 0.01
+52: STREAM_RECV_SLICE = 4096
+53: STREAM_RECV_ROUNDS = 3
+54: STREAM_RECV_MAX_BYTES = 8192
+55: # Downstream chunk size chosen so that exactly TWO chunks fit inside a
+56: # single TXT DNS answer: entry = 1(len) + 2(seq) + 67(data) = 70 bytes,
+57: # 70*2 = 140 = max TXT payload.  This gives 134 bytes/response (was 100).
+58: # For CNAME (max_payload=120) only 1 chunk fits -> 67 bytes (acceptable).
+59: DOWNSTREAM_CHUNK_SIZE = 67
+60: 
+61: # Rate limiting: max HELLO requests per source IP within window.
+62: # NOTE: in DNS tunneling, source IP = resolver, not real client.
+63: # Each resolver relays traffic for many clients, so limit must be high.
+64: HELLO_RATE_WINDOW = 60.0   # seconds
+65: HELLO_RATE_LIMIT = 120     # max new sessions per resolver-IP per window
+66: 
+67: 
+68: class _HelloRateLimiter:
+69:     """Per-IP rate limiter for HELLO requests with log throttling."""
+70: 
+71:     def __init__(self, window: float = HELLO_RATE_WINDOW, limit: int = HELLO_RATE_LIMIT) -> None:
+72:         self._lock = threading.Lock()
+73:         self._window = window
+74:         self._limit = limit
+75:         self._buckets: dict[str, list[float]] = {}
+76:         self._suppressed: dict[str, int] = {}  # ip -> suppressed count
+77: 
+78:     def allow(self, ip: str) -> bool:
+79:         now = time.time()
+80:         with self._lock:
+81:             times = self._buckets.get(ip)
+82:             if times is None:
+83:                 self._buckets[ip] = [now]
+84:                 return True
+85:             # Purge timestamps outside window.
+86:             cutoff = now - self._window
+87:             times[:] = [t for t in times if t > cutoff]
+88:             if len(times) >= self._limit:
+89:                 self._suppressed[ip] = self._suppressed.get(ip, 0) + 1
+90:                 return False
+91:             times.append(now)
+92:             return True
+93: 
+94:     def pop_suppressed(self) -> dict[str, int]:
+95:         """Return and reset suppressed counts for log throttling."""
+96:         with self._lock:
+97:             result = dict(self._suppressed)
+98:             self._suppressed.clear()
+99:         return result
+100: 
+101:     def cleanup(self) -> None:
+102:         now = time.time()
+103:         cutoff = now - self._window
+104:         with self._lock:
+105:             stale = [ip for ip, ts in self._buckets.items() if not ts or ts[-1] <= cutoff]
+106:             for ip in stale:
+107:                 del self._buckets[ip]
+108: 
+109: 
+110: class SessionStore:
+111:     def __init__(self, session_ttl: float = 900.0) -> None:
+112:         self._lock = threading.Lock()
+113:         self._session_ttl = max(30.0, session_ttl)
+114:         self._items: dict[int, dict] = {}
+115: 
+116:     def _generate_sid(self) -> int:
+117:         """Generate a cryptographically random session ID."""
+118:         while True:
+119:             sid = secrets.randbits(32)
+120:             if sid != 0 and sid not in self._items:
+121:                 return sid
+122: 
+123:     def new(self, addr: tuple[str, int]) -> int:
+124:         with self._lock:
+125:             sid = self._generate_sid()
+126:             self._items[sid] = {
+127:                 "addr": addr,
+128:                 "ts": time.time(),
+129:                 "stream_sock": None,
+130:                 "down_q": deque(),
+131:                 "down_seq": 1,
+132:                 "resp_cache": {},
+133:             }
+134:             return sid
+135: 
+136:     def exists(self, sid: int) -> bool:
+137:         stale_sock = None
+138:         exists_ok = False
+139:         with self._lock:
+140:             item = self._items.get(sid)
+141:             if item is None:
+142:                 exists_ok = False
+143:             elif time.time() - float(item.get("ts", 0.0)) > self._session_ttl:
+144:                 stale_sock = item.get("stream_sock")
+145:                 self._items.pop(sid, None)
+146:                 exists_ok = False
+147:             else:
+148:                 exists_ok = True
+149:         if stale_sock is not None:
+150:             try:
+151:                 stale_sock.close()
+152:             except Exception:
+153:                 pass
+154:         return exists_ok
+155: 
+156:     def get(self, sid: int) -> dict | None:
+157:         stale_sock = None
+158:         out: dict | None = None
+159:         with self._lock:
+160:             item = self._items.get(sid)
+161:             if item is None:
+162:                 out = None
+163:             elif time.time() - float(item.get("ts", 0.0)) > self._session_ttl:
+164:                 stale_sock = item.get("stream_sock")
+165:                 self._items.pop(sid, None)
+166:                 out = None
+167:             else:
+168:                 item["ts"] = time.time()
+169:                 out = item
+170:         if stale_sock is not None:
+171:             try:
+172:                 stale_sock.close()
+173:             except Exception:
+174:                 pass
+175:         return out
+176: 
+177:     def touch(self, sid: int) -> None:
+178:         with self._lock:
+179:             item = self._items.get(sid)
+180:             if item is not None:
+181:                 item["ts"] = time.time()
+182: 
+183:     def cleanup_expired(self) -> int:
+184:         now = time.time()
+185:         stale_socks = []
+186:         with self._lock:
+187:             stale_ids = [
+188:                 sid
+189:                 for sid, item in self._items.items()
+190:                 if now - float(item.get("ts", 0.0)) > self._session_ttl
+191:             ]
+192:             for sid in stale_ids:
+193:                 item = self._items.pop(sid, None)
+194:                 if item is not None and item.get("stream_sock") is not None:
+195:                     stale_socks.append(item["stream_sock"])
+196:         for st in stale_socks:
+197:             try:
+198:                 st.close()
+199:             except Exception:
+200:                 pass
+201:         return len(stale_socks) if stale_socks else len(stale_ids)
+202: 
+203: 
+204: def _extract_encoded_chunk(qname: str, zone: str) -> str:
+205:     base = qname.rstrip(".").lower()
+206:     zone_l = zone.rstrip(".").lower()
+207:     if not base.endswith(zone_l):
+208:         return ""
+209:     head = base[: -len(zone_l)].strip(".")
+210:     return head.replace(".", "")
+211: 
+212: 
+213: def _as_labels(s: str, size: int = 50) -> str:
+214:     return ".".join(s[i : i + size] for i in range(0, len(s), size))
+215: 
+216: 
+217: def _make_dns_answer(request: bytes, qtype: int, packet: bytes) -> bytes:
+218:     txt = encode_dns_data(packet)
+219:     if qtype == TYPE_TXT:
+220:         if len(txt) > 255:
+221:             log.warning("TXT payload too large (%d chars), truncating", len(txt))
+222:             txt = txt[:255]
+223:         return build_txt_answer(request, txt, ttl=0)
+224:     cname = _as_labels(txt) + ".x."
+225:     return build_cname_answer(request, cname)
+226: 
+227: 
+228: def _cache_get(sess: dict, msg_type: int, nonce: int) -> bytes | None:
+229:     return sess.get("resp_cache", {}).get((msg_type, nonce))
+230: 
+231: 
+232: def _cache_put(sess: dict, msg_type: int, nonce: int, packet: bytes) -> None:
+233:     cache = sess.setdefault("resp_cache", {})
+234:     cache[(msg_type, nonce)] = packet
+235:     if len(cache) > 256:
+236:         # Trim old items in insertion order for bounded memory.
+237:         for k in list(cache.keys())[:64]:
+238:             cache.pop(k, None)
+239: 
+240: 
+241: def _enqueue_downstream(sess: dict, raw: bytes, chunk_size: int = DOWNSTREAM_CHUNK_SIZE) -> None:
+242:     if not raw:
+243:         return
+244:     q = sess.setdefault("down_q", deque())
+245:     seq = int(sess.get("down_seq", 1))
+246:     for i in range(0, len(raw), chunk_size):
+247:         chunk = raw[i : i + chunk_size]
+248:         q.append((seq, chunk))
+249:         seq += 1
+250:     sess["down_seq"] = seq
+251: 
+252: 
+253: def run_server(
+254:     bind: str,
+255:     port: int,
+256:     zone: str,
+257:     session_ttl: float = 900.0,
+258:     cleanup_interval: float = 60.0,
+259: ) -> None:
+260:     sessions = SessionStore(session_ttl=session_ttl)
+261:     hello_limiter = _HelloRateLimiter()
+262:     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+263:     sock.bind((bind, port))
+264:     log.info(
+265:         "listening on %s:%d zone=%s session_ttl=%ss", bind, port, zone, session_ttl
+266:     )
+267:     last_cleanup = time.time()
+268: 
+269:     while True:
+270:         data, addr = sock.recvfrom(4096)
+271:         now = time.time()
+272:         if now - last_cleanup >= max(5.0, cleanup_interval):
+273:             removed = sessions.cleanup_expired()
+274:             hello_limiter.cleanup()
+275:             suppressed = hello_limiter.pop_suppressed()
+276:             if removed:
+277:                 log.info("cleanup expired sessions=%d", removed)
+278:             for sip, scnt in suppressed.items():
+279:                 log.warning("hello rate limited ip=%s suppressed=%d in last interval", sip, scnt)
+280:             last_cleanup = now
+281:         try:
+282:             qid, qname, qtype = parse_query(data)
+283:             if qtype == TYPE_NS:
+284:                 sock.sendto(build_ns_answer(data, zone), addr)
+285:                 continue
+286:             if qtype == TYPE_SOA:
+287:                 sock.sendto(build_soa_answer(data, zone), addr)
+288:                 continue
+289:             if qtype not in (TYPE_TXT, TYPE_A):
+290:                 sock.sendto(build_noerror_empty(data), addr)
+291:                 continue
+292:             encoded = _extract_encoded_chunk(qname, zone)
+293:             if not encoded:
+294:                 sock.sendto(build_noerror_empty(data), addr)
+295:                 continue
+296: 
+297:             # Probe echo: scanner sends nxprobe-<nonce>, server echoes it
+298:             if encoded.startswith("nxprobe"):
+299:                 sock.sendto(build_txt_answer(data, encoded, ttl=0), addr)
+300:                 continue
+301: 
+302:             packet = unpack_packet(decode_dns_data(encoded))
+303:             if packet.msg_type == TYPE_HELLO:
+304:                 if not hello_limiter.allow(addr[0]):
+305:                     sock.sendto(build_noerror_empty(data), addr)
+306:                     continue
+307:                 sid = sessions.new(addr)
+308:                 ack = pack_packet(TYPE_HELLO_ACK, sid, packet.nonce, b"OK")
+309:                 answer = _make_dns_answer(data, qtype, ack)
+310:                 sock.sendto(answer, addr)
+311:                 log.debug(
+312:                     "hello from %s:%d -> session=%d", addr[0], addr[1], sid
+313:                 )
+314:                 continue
+315: 
+316:             if packet.msg_type == TYPE_DATA and sessions.exists(packet.session_id):
+317:                 sess = sessions.get(packet.session_id)
+318:                 if sess is None:
+319:                     sock.sendto(build_noerror_empty(data), addr)
+320:                     continue
+321:                 sessions.touch(packet.session_id)
+322:                 cached = _cache_get(sess, TYPE_DATA, packet.nonce)
+323:                 if cached is not None:
+324:                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
+325:                     continue
+326:                 # Keep ACK payload tiny to survive strict DNS relays.
+327:                 ack_data = b"K"
+328:                 ack = pack_packet(
+329:                     TYPE_DATA_ACK, packet.session_id, packet.nonce, ack_data
+330:                 )
+331:                 _cache_put(sess, TYPE_DATA, packet.nonce, ack)
+332:                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+333:                 continue
+334: 
+335:             if packet.msg_type == TYPE_STREAM_OPEN and sessions.exists(packet.session_id):
+336:                 sess = sessions.get(packet.session_id)
+337:                 if sess is None:
+338:                     sock.sendto(build_noerror_empty(data), addr)
+339:                     continue
+340:                 sessions.touch(packet.session_id)
+341:                 cached = _cache_get(sess, TYPE_STREAM_OPEN, packet.nonce)
+342:                 if cached is not None:
+343:                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
+344:                     continue
+345: 
+346:                 # payload format: b"host:port"
+347:                 try:
+348:                     target = packet.payload.decode("ascii", errors="ignore")
+349:                     host, p = target.rsplit(":", 1)
+350:                     tport = int(p)
+351:                     stream_sock = socket.create_connection((host, tport), timeout=1.5)
+352:                     # Keep recv non-blocking enough for DNS round-trip timing.
+353:                     stream_sock.settimeout(STREAM_SOCK_TIMEOUT)
+354:                     old = sess.get("stream_sock")
+355:                     if old is not None:
+356:                         try:
+357:                             old.close()
+358:                         except Exception:
+359:                             pass
+360:                     sess["stream_sock"] = stream_sock
+361:                     sess["down_q"] = deque()
+362:                     sess["down_seq"] = 1
+363:                     ack = pack_packet(
+364:                         TYPE_STREAM_OPEN_ACK, packet.session_id, packet.nonce, b"OK"
+365:                     )
+366:                     log.info(
+367:                         "stream open session=%d target=%s:%d", packet.session_id, host, tport
+368:                     )
+369:                 except Exception:
+370:                     ack = pack_packet(
+371:                         TYPE_STREAM_OPEN_ACK,
+372:                         packet.session_id,
+373:                         packet.nonce,
+374:                         b"ER",
+375:                     )
+376:                     log.warning(
+377:                         "stream open failed session=%d", packet.session_id
+378:                     )
+379:                 _cache_put(sess, TYPE_STREAM_OPEN, packet.nonce, ack)
+380:                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+381:                 continue
+382: 
+383:             if packet.msg_type == TYPE_STREAM_SEND and sessions.exists(packet.session_id):
+384:                 sess = sessions.get(packet.session_id)
+385:                 if sess is None or sess.get("stream_sock") is None:
+386:                     # Drain any remaining downstream data first
+387:                     q = sess.get("down_q", deque()) if sess else deque()
+388:                     if q:
+389:                         max_payload = 140 if qtype == TYPE_TXT else 120
+390:                         out_payload = b""
+391:                         while q:
+392:                             seq, out_chunk = q[0]
+393:                             entry_body = seq.to_bytes(2, "big") + out_chunk
+394:                             entry = bytes([len(entry_body)]) + entry_body
+395:                             if len(out_payload) + len(entry) > max_payload:
+396:                                 break
+397:                             q.popleft()
+398:                             out_payload += entry
+399:                         log.debug("stream_send: session %d draining q, %d bytes left", packet.session_id, len(q))
+400:                         ack = pack_packet(TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload)
+401:                     else:
+402:                         log.debug("stream_send: session %d backend dead, signalling close", packet.session_id)
+403:                         ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"")
+404:                     sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+405:                     continue
+406:                 sessions.touch(packet.session_id)
+407:                 cached = _cache_get(sess, TYPE_STREAM_SEND, packet.nonce)
+408:                 if cached is not None:
+409:                     sock.sendto(_make_dns_answer(data, qtype, cached), addr)
+410:                     continue
+411:                 st = sess["stream_sock"]
+412:                 try:
+413:                     if packet.payload:
+414:                         st.sendall(packet.payload)
+415:                     recv_chunks = []
+416:                     recv_total = 0
+417:                     for _ in range(STREAM_RECV_ROUNDS):
+418:                         if recv_total >= STREAM_RECV_MAX_BYTES:
+419:                             break
+420:                         try:
+421:                             part = st.recv(min(STREAM_RECV_SLICE, STREAM_RECV_MAX_BYTES - recv_total))
+422:                             if not part:
+423:                                 break
+424:                             recv_chunks.append(part)
+425:                             recv_total += len(part)
+426:                             if len(part) < STREAM_RECV_SLICE:
+427:                                 break
+428:                         except socket.timeout:
+429:                             break
+430:                     recv_data = b"".join(recv_chunks)
+431:                     _enqueue_downstream(sess, recv_data, chunk_size=DOWNSTREAM_CHUNK_SIZE)
+432:                     q = sess.get("down_q", deque())
+433:                     # Pack as many queued chunks as fit in one DNS response.
+434:                     # TXT: 254 base32 chars -> 158 raw -> 143 payload, use 140.
+435:                     # CNAME: ~220 base32 chars -> 137 raw -> 122 payload, use 120.
+436:                     max_payload = 140 if qtype == TYPE_TXT else 120
+437:                     out_payload = b""
+438:                     while q:
+439:                         seq, out_chunk = q[0]
+440:                         entry_body = seq.to_bytes(2, "big") + out_chunk
+441:                         entry = bytes([len(entry_body)]) + entry_body
+442:                         if len(out_payload) + len(entry) > max_payload:
+443:                             break
+444:                         q.popleft()
+445:                         out_payload += entry
+446:                     log.debug(
+447:                         "stream data sid=%d up=%d down=%d q=%d",
+448:                         packet.session_id, len(packet.payload), len(recv_data), len(q),
+449:                     )
+450:                     ack = pack_packet(
+451:                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, out_payload
+452:                     )
+453:                 except (BrokenPipeError, ConnectionResetError, OSError) as e:
+454:                     log.warning("stream send error session=%d: %s", packet.session_id, e)
+455:                     try:
+456:                         st.close()
+457:                     except Exception:
+458:                         pass
+459:                     sess["stream_sock"] = None
+460:                     ack = pack_packet(
+461:                         TYPE_STREAM_RECV, packet.session_id, packet.nonce, b""
+462:                     )
+463:                 _cache_put(sess, TYPE_STREAM_SEND, packet.nonce, ack)
+464:                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+465:                 continue
+466: 
+467:             if packet.msg_type == TYPE_STREAM_CLOSE and sessions.exists(packet.session_id):
+468:                 sess = sessions.get(packet.session_id)
+469:                 if sess is not None and sess.get("stream_sock") is not None:
+470:                     try:
+471:                         sess["stream_sock"].close()
+472:                     except Exception:
+473:                         pass
+474:                     sess["stream_sock"] = None
+475:                     sess["down_q"] = deque()
+476:                 ack = pack_packet(TYPE_STREAM_CLOSE, packet.session_id, packet.nonce, b"K")
+477:                 if sess is not None:
+478:                     sessions.touch(packet.session_id)
+479:                     _cache_put(sess, TYPE_STREAM_CLOSE, packet.nonce, ack)
+480:                 sock.sendto(_make_dns_answer(data, qtype, ack), addr)
+481:                 continue
+482: 
+483:             sock.sendto(build_noerror_empty(data), addr)
+484:         except binascii.Error:
+485:             try:
+486:                 sock.sendto(build_noerror_empty(data), addr)
+487:             except Exception:
+488:                 pass
+489:         except Exception:
+490:             log.warning("packet parse/handle error from %s", addr, exc_info=True)
+491:             try:
+492:                 sock.sendto(build_noerror_empty(data), addr)
+493:             except Exception:
+494:                 pass
+495: 
+496: 
+497: def main() -> None:
+498:     p = argparse.ArgumentParser(description="Nexora phase-1 server")
+499:     p.add_argument("--bind", default="0.0.0.0")
+500:     p.add_argument("--port", type=int, default=53)
+501:     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
+502:     p.add_argument(
+503:         "--log-level",
+504:         default="INFO",
+505:         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+506:         help="logging verbosity (default: INFO)",
+507:     )
+508:     p.add_argument(
+509:         "--session-ttl",
+510:         type=float,
+511:         default=900.0,
+512:         help="expire inactive sessions after this many seconds",
+513:     )
+514:     p.add_argument(
+515:         "--cleanup-interval",
+516:         type=float,
+517:         default=60.0,
+518:         help="run session cleanup every N seconds",
+519:     )
+520:     args = p.parse_args()
+521:     logging.basicConfig(
+522:         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+523:         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+524:     )
+525:     run_server(
+526:         args.bind,
+527:         args.port,
+528:         args.zone,
+529:         session_ttl=args.session_ttl,
+530:         cleanup_interval=args.cleanup_interval,
+531:     )
+532: 
+533: 
+534: if __name__ == "__main__":
+535:     main()

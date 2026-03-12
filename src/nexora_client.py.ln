@@ -1,0 +1,1249 @@
+1: """
+2: Nexora phase-1 client:
+3: - builds HELLO packet
+4: - sends DNS TXT query
+5: - validates HELLO_ACK
+6: Signature: Rmn JL
+7: """
+8: 
+9: from __future__ import annotations
+10: 
+11: import argparse
+12: import ipaddress
+13: import json
+14: import logging
+15: import os
+16: import random
+17: import socket
+18: import threading
+19: import time
+20: from collections import OrderedDict
+21: from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait, FIRST_COMPLETED
+22: from threading import Lock
+23: 
+24: from dns_wire import TYPE_A, TYPE_TXT, build_query, parse_answer_data
+25: from nexora_proto import (
+26:     TYPE_DATA,
+27:     TYPE_DATA_ACK,
+28:     TYPE_HELLO,
+29:     TYPE_HELLO_ACK,
+30:     TYPE_STREAM_CLOSE,
+31:     TYPE_STREAM_OPEN,
+32:     TYPE_STREAM_OPEN_ACK,
+33:     TYPE_STREAM_RECV,
+34:     TYPE_STREAM_SEND,
+35:     decode_dns_data,
+36:     encode_dns_data,
+37:     pack_packet,
+38:     random_nonce,
+39:     unpack_packet,
+40: )
+41: 
+42: log = logging.getLogger("nexora-client")
+43: 
+44: # Maximum outstanding out-of-order sequence entries before dropping oldest.
+45: SEQ_MAP_MAX_SIZE = 512
+46: 
+47: 
+48: def chunk_label(s: str, size: int = 44) -> str:
+49:     return ".".join(s[i : i + size] for i in range(0, len(s), size))
+50: 
+51: 
+52: def _is_public_ipv4(ip: str) -> bool:
+53:     try:
+54:         addr = ipaddress.ip_address(ip.strip())
+55:         return addr.version == 4 and addr.is_global
+56:     except ValueError:
+57:         return False
+58: 
+59: 
+60: def _sanitize_resolvers(items: list[str]) -> list[str]:
+61:     out: list[str] = []
+62:     seen: set[str] = set()
+63:     for raw in items:
+64:         ip = str(raw).strip()
+65:         if not ip or ip in seen:
+66:             continue
+67:         if not _is_public_ipv4(ip):
+68:             continue
+69:         seen.add(ip)
+70:         out.append(ip)
+71:     return out
+72: 
+73: 
+74: class ResolverSelector:
+75:     def __init__(
+76:         self,
+77:         servers: list[str],
+78:         fail_cooldown: float = 5.0,
+79:         max_inflight_per_resolver: int = 2,
+80:         ewma_alpha: float = 0.2,
+81:     ) -> None:
+82:         uniq = []
+83:         for s in servers:
+84:             s = s.strip()
+85:             if s and s not in uniq:
+86:                 uniq.append(s)
+87:         if not uniq:
+88:             raise ValueError("no resolver servers provided")
+89:         self._servers = uniq
+90:         self._fail_cooldown = max(1.0, fail_cooldown)
+91:         self._lock = Lock()
+92:         self._active = uniq[0]
+93:         self._probe_idx = 0
+94:         self._last_switch = time.time()
+95:         self._health_thread_started = False
+96:         self._fails: dict[str, int] = {s: 0 for s in uniq}
+97:         self._bad_until: dict[str, float] = {s: 0.0 for s in uniq}
+98:         self._order: dict[str, int] = {s: i for i, s in enumerate(uniq)}
+99:         self._timeout_streak: dict[str, int] = {s: 0 for s in uniq}
+100:         self._max_inflight_per_resolver = max(1, max_inflight_per_resolver)
+101:         self._ewma_alpha = min(0.8, max(0.05, ewma_alpha))
+102:         self._inflight: dict[str, int] = {s: 0 for s in uniq}
+103:         self._success_ewma: dict[str, float] = {s: 0.5 for s in uniq}
+104:         self._latency_ewma_ms: dict[str, float] = {s: 700.0 for s in uniq}
+105: 
+106:     def _preferred_server_locked(self, now: float) -> str:
+107:         good = [s for s in self._servers if now >= self._bad_until.get(s, 0.0)]
+108:         pool = good or self._servers
+109:         return min(
+110:             pool,
+111:             key=lambda s: (
+112:                 self._fails.get(s, 0),
+113:                 self._bad_until.get(s, 0.0),
+114:                 self._order.get(s, 0),
+115:             ),
+116:         )
+117: 
+118:     def choose(self) -> str:
+119:         now = time.time()
+120:         with self._lock:
+121:             preferred = self._preferred_server_locked(now)
+122:             active_bad = now < self._bad_until.get(self._active, 0.0)
+123:             active_fails = self._fails.get(self._active, 0)
+124:             pref_fails = self._fails.get(preferred, 0)
+125:             if active_bad or pref_fails + 1 < active_fails:
+126:                 self._active = preferred
+127:             return self._active
+128: 
+129:     def choose_next(self, exclude: set | None = None) -> str | None:
+130:         """Weighted power-of-two choices across healthy resolvers."""
+131:         now = time.time()
+132:         with self._lock:
+133:             pool = [
+134:                 s
+135:                 for s in self._servers
+136:                 if now >= self._bad_until.get(s, 0.0)
+137:                 and self._inflight.get(s, 0) < self._max_inflight_per_resolver
+138:                 and (not exclude or s not in exclude)
+139:             ]
+140:             if not pool:
+141:                 pool = [
+142:                     s
+143:                     for s in self._servers
+144:                     if now >= self._bad_until.get(s, 0.0)
+145:                     and (not exclude or s not in exclude)
+146:                 ]
+147:             if not pool:
+148:                 pool = [s for s in self._servers if not exclude or s not in exclude]
+149:             if not pool:
+150:                 return None
+151: 
+152:             if len(pool) == 1:
+153:                 chosen = pool[0]
+154:             else:
+155:                 a = random.choice(pool)
+156:                 b = random.choice(pool)
+157:                 while b == a and len(pool) > 1:
+158:                     b = random.choice(pool)
+159: 
+160:                 def _score(server: str) -> float:
+161:                     succ = self._success_ewma.get(server, 0.5)
+162:                     lat = self._latency_ewma_ms.get(server, 700.0)
+163:                     fail = float(self._fails.get(server, 0))
+164:                     inflight = float(self._inflight.get(server, 0))
+165:                     return (succ * 3.2) - min(3.0, lat / 250.0) - (fail * 0.2) - (inflight * 0.8)
+166: 
+167:                 chosen = a if _score(a) >= _score(b) else b
+168: 
+169:             self._inflight[chosen] = self._inflight.get(chosen, 0) + 1
+170:             return chosen
+171: 
+172:     def release(self, server: str) -> None:
+173:         with self._lock:
+174:             if server not in self._inflight:
+175:                 return
+176:             cur = self._inflight.get(server, 0)
+177:             self._inflight[server] = cur - 1 if cur > 0 else 0
+178: 
+179:     def report_success(self, server: str, latency_ms: float | None = None) -> None:
+180:         with self._lock:
+181:             self._fails[server] = 0
+182:             self._bad_until[server] = 0.0
+183:             self._timeout_streak[server] = 0
+184:             prev_succ = self._success_ewma.get(server, 0.5)
+185:             self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ + self._ewma_alpha
+186:             if latency_ms is not None:
+187:                 prev_lat = self._latency_ewma_ms.get(server, 700.0)
+188:                 self._latency_ewma_ms[server] = (
+189:                     (1.0 - self._ewma_alpha) * prev_lat + self._ewma_alpha * max(1.0, latency_ms)
+190:                 )
+191: 
+192:     def report_failure(
+193:         self,
+194:         server: str,
+195:         is_timeout: bool = False,
+196:         latency_ms: float | None = None,
+197:     ) -> None:
+198:         now = time.time()
+199:         with self._lock:
+200:             f = self._fails.get(server, 0) + 1
+201:             self._fails[server] = f
+202:             prev_succ = self._success_ewma.get(server, 0.5)
+203:             self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
+204:             if latency_ms is not None:
+205:                 prev_lat = self._latency_ewma_ms.get(server, 700.0)
+206:                 self._latency_ewma_ms[server] = (
+207:                     (1.0 - self._ewma_alpha) * prev_lat + self._ewma_alpha * max(1.0, latency_ms)
+208:                 )
+209:             if is_timeout:
+210:                 streak = self._timeout_streak.get(server, 0) + 1
+211:                 self._timeout_streak[server] = streak
+212:                 if streak >= 3:
+213:                     self._bad_until[server] = now + 60.0
+214:                     if server == self._active:
+215:                         self._active = self._preferred_server_locked(now)
+216:                     return
+217:             else:
+218:                 self._timeout_streak[server] = 0
+219:             cooldown = self._fail_cooldown * min(f, 3)
+220:             self._bad_until[server] = now + cooldown
+221:             if server == self._active:
+222:                 self._active = self._preferred_server_locked(now)
+223: 
+224:     def report_nxdomain(self, server: str) -> None:
+225:         """NXDOMAIN means resolver cannot resolve our zone. Long blacklist."""
+226:         now = time.time()
+227:         with self._lock:
+228:             was_new = self._fails.get(server, 0) < 100
+229:             self._fails[server] = 100
+230:             self._bad_until[server] = now + 300.0
+231:             prev_succ = self._success_ewma.get(server, 0.5)
+232:             self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
+233:             if server == self._active:
+234:                 self._active = self._preferred_server_locked(now)
+235:         if was_new:
+236:             log.info("resolver NXDOMAIN blacklist %s for 300s", server)
+237: 
+238:     def report_no_answer(self, server: str) -> None:
+239:         """Server returns empty answer — likely can't resolve our zone."""
+240:         now = time.time()
+241:         with self._lock:
+242:             was_new = self._fails.get(server, 0) < 50
+243:             self._fails[server] = 50
+244:             self._bad_until[server] = now + 120.0
+245:             prev_succ = self._success_ewma.get(server, 0.5)
+246:             self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
+247:             if server == self._active:
+248:                 self._active = self._preferred_server_locked(now)
+249:         if was_new:
+250:             log.info("resolver no-answer blacklist %s for 120s", server)
+251: 
+252:     def report_blocked(self, server: str, reason: str = "SERVFAIL") -> None:
+253:         """Resolver explicitly blocks/fails our zone (SERVFAIL/REFUSED)."""
+254:         now = time.time()
+255:         with self._lock:
+256:             was_new = self._fails.get(server, 0) < 80
+257:             self._fails[server] = 80
+258:             self._bad_until[server] = now + 180.0
+259:             self._timeout_streak[server] = 0
+260:             prev_succ = self._success_ewma.get(server, 0.5)
+261:             self._success_ewma[server] = (1.0 - self._ewma_alpha) * prev_succ
+262:             if server == self._active:
+263:                 self._active = self._preferred_server_locked(now)
+264:         if was_new:
+265:             log.info("resolver %s blacklist %s for 180s", reason, server)
+266: 
+267:     def rotate_active(self) -> str:
+268:         now = time.time()
+269:         with self._lock:
+270:             self._active = self._preferred_server_locked(now)
+271:             return self._active
+272: 
+273:     def start_background_health_loop(
+274:         self,
+275:         probe_fn,
+276:         interval_sec: float,
+277:         switch_sec: float,
+278:     ) -> None:
+279:         if len(self._servers) <= 1:
+280:             return
+281:         with self._lock:
+282:             if self._health_thread_started:
+283:                 return
+284:             self._health_thread_started = True
+285:             self._last_switch = time.time()
+286:             self._probe_idx = 0
+287: 
+288:         def _loop() -> None:
+289:             while True:
+290:                 with self._lock:
+291:                     s = self._servers[self._probe_idx % len(self._servers)]
+292:                     self._probe_idx += 1
+293:                 ok = False
+294:                 try:
+295:                     ok = bool(probe_fn(s))
+296:                 except Exception:
+297:                     ok = False
+298:                 if ok:
+299:                     self.report_success(s)
+300:                 else:
+301:                     self.report_failure(s)
+302: 
+303:                 now = time.time()
+304:                 with self._lock:
+305:                     do_switch = now - self._last_switch >= switch_sec
+306:                     if do_switch:
+307:                         self._last_switch = now
+308:                 if do_switch:
+309:                     nxt = self.rotate_active()
+310:                     log.info("resolver rotate -> %s", nxt)
+311:                 time.sleep(max(1.0, interval_sec))
+312: 
+313:         t = threading.Thread(target=_loop, daemon=True)
+314:         t.start()
+315: 
+316:     def update_servers(self, new_servers: list[str]) -> None:
+317:         """Hot-reload the resolver list without restarting."""
+318:         uniq = []
+319:         for s in new_servers:
+320:             s = s.strip()
+321:             if s and s not in uniq:
+322:                 uniq.append(s)
+323:         if not uniq:
+324:             return
+325:         with self._lock:
+326:             old = set(self._servers)
+327:             self._servers = uniq
+328:             for s in uniq:
+329:                 if s not in old:
+330:                     self._fails[s] = 0
+331:                     self._bad_until[s] = 0.0
+332:                     self._order[s] = len(self._order)
+333:                     self._timeout_streak[s] = 0
+334:                     self._inflight[s] = 0
+335:                     self._success_ewma[s] = 0.5
+336:                     self._latency_ewma_ms[s] = 700.0
+337:             if self._active not in uniq:
+338:                 self._active = uniq[0]
+339:             # Trim stale stats for removed resolvers.
+340:             keep = set(uniq)
+341:             self._fails = {k: v for k, v in self._fails.items() if k in keep}
+342:             self._bad_until = {k: v for k, v in self._bad_until.items() if k in keep}
+343:             self._timeout_streak = {k: v for k, v in self._timeout_streak.items() if k in keep}
+344:             self._inflight = {k: v for k, v in self._inflight.items() if k in keep}
+345:             self._success_ewma = {k: v for k, v in self._success_ewma.items() if k in keep}
+346:             self._latency_ewma_ms = {
+347:                 k: v for k, v in self._latency_ewma_ms.items() if k in keep
+348:             }
+349:             self._order = {k: v for k, v in self._order.items() if k in keep}
+350:         log.info("resolver list updated: %s", ",".join(uniq))
+351: 
+352:     @property
+353:     def servers(self) -> list[str]:
+354:         return list(self._servers)
+355: 
+356:     @property
+357:     def active(self) -> str:
+358:         with self._lock:
+359:             return self._active
+360: 
+361: 
+362: class _DnsQueryPacer:
+363:     """Per-resolver rate limiter.
+364: 
+365:     Each resolver gets its own independent pacing so that N resolvers
+366:     yield N times the throughput of a single resolver.
+367:     """
+368: 
+369:     def __init__(self, min_interval: float = 0.15) -> None:
+370:         self._lock = Lock()
+371:         self._interval = min_interval
+372:         self._next_send: dict[str, float] = {}  # per-resolver
+373: 
+374:     def pace(self, resolver: str = "") -> None:
+375:         with self._lock:
+376:             now = time.time()
+377:             ns = self._next_send.get(resolver, 0.0)
+378:             if now < ns:
+379:                 wait = ns - now
+380:                 self._next_send[resolver] = ns + self._interval
+381:             else:
+382:                 wait = 0.0
+383:                 self._next_send[resolver] = now + self._interval
+384:         if wait > 0:
+385:             time.sleep(wait)
+386: 
+387: 
+388: _dns_pacer: _DnsQueryPacer | None = None
+389: 
+390: 
+391: def _query_pkt_direct(
+392:     server: str,
+393:     port: int,
+394:     zone: str,
+395:     timeout: float,
+396:     payload: bytes,
+397:     qtype: int,
+398: ) -> tuple[int, object]:
+399:     encoded = encode_dns_data(payload)
+400:     fqdn = f"{chunk_label(encoded)}.{zone.strip('.')}"
+401:     qid, query = build_query(fqdn, qtype=qtype)
+402:     if _dns_pacer is not None:
+403:         _dns_pacer.pace(server)
+404:     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+405:     sock.settimeout(timeout)
+406:     try:
+407:         sock.sendto(query, (server, port))
+408:         resp, _ = sock.recvfrom(4096)
+409:         txt = parse_answer_data(resp, qid)
+410:         if txt.endswith(".nexora"):
+411:             txt = txt[: -len(".nexora")].strip(".")
+412:         elif txt.endswith(".x"):
+413:             txt = txt[: -len(".x")].strip(".")
+414:         return qid, unpack_packet(decode_dns_data(txt))
+415:     finally:
+416:         sock.close()
+417: 
+418: 
+419: def _query_txt(
+420:     selector: ResolverSelector,
+421:     port: int,
+422:     zone: str,
+423:     timeout: float,
+424:     payload: bytes,
+425:     attempts: int,
+426:     qtype: int,
+427: ) -> tuple[int, object]:
+428:     last_err = None
+429:     last_server = ""
+430:     dead_servers: set[str] = set()   # hard-dead for this call (NXDOMAIN/blocked)
+431:     tried_servers: set[str] = set()  # avoid retrying same resolver in one query
+432:     for idx in range(max(1, attempts)):
+433:         server = selector.choose_next(exclude=dead_servers | tried_servers)
+434:         if server is None:
+435:             # No untried resolver left for this query - bail early.
+436:             break
+437:         tried_servers.add(server)
+438:         last_server = server
+439:         t0 = time.time()
+440:         try:
+441:             qid, pkt = _query_pkt_direct(server, port, zone, timeout, payload, qtype)
+442:             selector.report_success(server, latency_ms=(time.time() - t0) * 1000.0)
+443:             return qid, pkt
+444:         except Exception as e:
+445:             last_err = e
+446:             err_str = str(e)
+447:             is_timeout = "timed out" in err_str
+448:             if "NXDOMAIN" in err_str:
+449:                 selector.report_nxdomain(server)
+450:                 dead_servers.add(server)
+451:             elif "no answer" in err_str:
+452:                 selector.report_no_answer(server)
+453:                 dead_servers.add(server)
+454:             elif "SERVFAIL" in err_str:
+455:                 selector.report_blocked(server, reason="SERVFAIL")
+456:                 dead_servers.add(server)
+457:             elif "REFUSED" in err_str:
+458:                 selector.report_blocked(server, reason="REFUSED")
+459:                 dead_servers.add(server)
+460:             else:
+461:                 selector.report_failure(
+462:                     server,
+463:                     is_timeout=is_timeout,
+464:                     latency_ms=(time.time() - t0) * 1000.0,
+465:                 )
+466:             log.warning("query attempt %d/%d failed server=%s: %s", idx + 1, attempts, server, e)
+467:             # Skip delay for hard-dead resolvers (try next immediately).
+468:             if (
+469:                 "NXDOMAIN" not in err_str
+470:                 and "no answer" not in err_str
+471:                 and "SERVFAIL" not in err_str
+472:                 and "REFUSED" not in err_str
+473:             ):
+474:                 time.sleep(0.03 if idx < 3 else 0.5)
+475:         finally:
+476:             selector.release(server)
+477:     used = len(tried_servers)
+478:     raise TimeoutError(
+479:         f"dns query failed after {used} attempts (last resolver {last_server}): {last_err}"
+480:     )
+481: 
+482: 
+483: def run_client(selector: ResolverSelector,
+484:     port: int,
+485:     zone: str,
+486:     timeout: float,
+487:     attempts: int,
+488:     qtype: int,
+489: ) -> int:
+490:     nonce = random_nonce()
+491:     hello = pack_packet(TYPE_HELLO, 0, nonce, b"NEXORA_HELLO")
+492:     _, pkt = _query_txt(selector, port, zone, timeout, hello, attempts, qtype)
+493: 
+494:     if pkt.msg_type != TYPE_HELLO_ACK:
+495:         raise RuntimeError("unexpected packet type")
+496:     if pkt.nonce != nonce:
+497:         raise RuntimeError("nonce mismatch")
+498:     sid = pkt.session_id
+499:     log.info("handshake ok, session_id=%d, payload=%r", sid, pkt.payload)
+500: 
+501:     # Phase-2 data exchange test
+502:     time.sleep(0.25)
+503:     dnonce = random_nonce()
+504:     data_pkt = pack_packet(TYPE_DATA, sid, dnonce, b"phase2_data")
+505:     _, dpkt = _query_txt(selector, port, zone, timeout, data_pkt, attempts, qtype)
+506:     if dpkt.msg_type != TYPE_DATA_ACK:
+507:         raise RuntimeError("unexpected data-ack type")
+508:     if dpkt.session_id != sid or dpkt.nonce != dnonce:
+509:         raise RuntimeError("data-ack mismatch")
+510:     log.info("data ack ok, payload=%r", dpkt.payload)
+511:     return sid
+512: 
+513: 
+514: def _establish_session(
+515:     selector: ResolverSelector,
+516:     port: int,
+517:     zone: str,
+518:     timeout: float,
+519:     attempts: int,
+520:     qtype: int,
+521: ) -> int:
+522:     nonce = random_nonce()
+523:     hello = pack_packet(TYPE_HELLO, 0, nonce, b"NEXORA_HELLO")
+524:     _, pkt = _query_txt(selector, port, zone, timeout, hello, attempts, qtype)
+525:     if pkt.msg_type != TYPE_HELLO_ACK or pkt.nonce != nonce:
+526:         raise RuntimeError("session handshake failed")
+527:     return pkt.session_id
+528: 
+529: 
+530: def _stream_open(
+531:     sid: int,
+532:     selector: ResolverSelector,
+533:     port: int,
+534:     zone: str,
+535:     timeout: float,
+536:     attempts: int,
+537:     qtype: int,
+538:     target_host: str,
+539:     target_port: int,
+540:     open_retries: int = 1,
+541:     retry_delay: float = 0.2,
+542: ) -> None:
+543:     last_err: Exception | None = None
+544:     for idx in range(max(1, open_retries)):
+545:         n = random_nonce()
+546:         try:
+547:             op = pack_packet(
+548:                 TYPE_STREAM_OPEN, sid, n, f"{target_host}:{target_port}".encode("ascii")
+549:             )
+550:             _, rp = _query_txt(selector, port, zone, timeout, op, attempts, qtype)
+551:             if rp.msg_type == TYPE_STREAM_OPEN_ACK and rp.nonce == n and rp.payload == b"OK":
+552:                 return
+553:             last_err = RuntimeError(f"stream open failed: {rp.payload!r}")
+554:         except Exception as e:
+555:             last_err = e
+556:         if idx + 1 < open_retries:
+557:             time.sleep(retry_delay * (idx + 1))
+558:     raise RuntimeError(str(last_err) if last_err else "stream open failed")
+559: 
+560: 
+561: def _stream_close(
+562:     sid: int,
+563:     selector: ResolverSelector,
+564:     port: int,
+565:     zone: str,
+566:     timeout: float,
+567:     attempts: int,
+568:     qtype: int,
+569: ) -> None:
+570:     n = random_nonce()
+571:     cp = pack_packet(TYPE_STREAM_CLOSE, sid, n, b"")
+572:     try:
+573:         _, rp = _query_txt(selector, port, zone, timeout, cp, attempts, qtype)
+574:         if rp.msg_type != TYPE_STREAM_CLOSE or rp.nonce != n:
+575:             return
+576:     except Exception:
+577:         return
+578: 
+579: 
+580: def _extract_seq_chunk(payload: bytes) -> tuple[int | None, bytes]:
+581:     """Extract a single (seq, chunk) from length-prefixed format: [1B len][2B seq][data]."""
+582:     if len(payload) < 3:
+583:         return None, b""
+584:     entry_len = payload[0]
+585:     if entry_len < 2 or len(payload) < 1 + entry_len:
+586:         return None, b""
+587:     seq = int.from_bytes(payload[1:3], "big")
+588:     return seq, payload[3:1 + entry_len]
+589: 
+590: 
+591: def _extract_seq_chunks(payload: bytes) -> list[tuple[int, bytes]]:
+592:     """Extract multiple (seq, chunk) pairs from length-prefixed packed response.
+593: 
+594:     Format: [1B entry_len][2B seq][data] repeated.
+595:     """
+596:     results: list[tuple[int, bytes]] = []
+597:     offset = 0
+598:     while offset < len(payload):
+599:         if offset + 1 > len(payload):
+600:             break
+601:         entry_len = payload[offset]
+602:         offset += 1
+603:         if entry_len < 2 or offset + entry_len > len(payload):
+604:             break
+605:         seq = int.from_bytes(payload[offset:offset + 2], "big")
+606:         data = payload[offset + 2:offset + entry_len]
+607:         offset += entry_len
+608:         if data:
+609:             results.append((seq, data))
+610:     return results
+611: 
+612: 
+613: def _handle_forward_conn(
+614:     local_conn: socket.socket,
+615:     client_addr: tuple[str, int],
+616:     selector: ResolverSelector,
+617:     port: int,
+618:     zone: str,
+619:     timeout: float,
+620:     attempts: int,
+621:     qtype: int,
+622:     target_host: str,
+623:     target_port: int,
+624:     chunk_size: int,
+625:     stream_open_retries: int,
+626:     poll_min_interval: float,
+627:     poll_max_interval: float,
+628:     idle_timeout: float,
+629:     pipeline_depth: int = 1,
+630: ) -> None:
+631:     sid = None
+632:     try:
+633:         local_conn.settimeout(0.05)
+634:         # Enable TCP keepalive to detect dead peers quickly (unclean disconnect)
+635:         local_conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+636:         try:
+637:             # Linux: start keepalive after 5s idle, probe every 3s, fail after 3 probes (~14s)
+638:             local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+639:             local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+640:             local_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+641:         except (AttributeError, OSError):
+642:             pass  # not available on all platforms
+643:         # Create a fresh session and retry stream-open a few times.
+644:         for _ in range(max(1, stream_open_retries)):
+645:             sid = _establish_session(selector, port, zone, timeout, attempts, qtype)
+646:             try:
+647:                 _stream_open(
+648:                     sid,
+649:                     selector,
+650:                     port,
+651:                     zone,
+652:                     timeout,
+653:                     attempts,
+654:                     qtype,
+655:                     target_host,
+656:                     target_port,
+657:                     open_retries=2,
+658:                 )
+659:                 break
+660:             except Exception:
+661:                 _stream_close(sid, selector, port, zone, timeout, attempts, qtype)
+662:                 sid = None
+663:         if sid is None:
+664:             raise RuntimeError("stream open failed")
+665:         log.info(
+666:             "forward open local=%s:%d sid=%d target=%s:%d",
+667:             client_addr[0], client_addr[1], sid, target_host, target_port,
+668:         )
+669: 
+670:         seq_map: "OrderedDict[int, bytes]" = OrderedDict()
+671:         next_seq = 1
+672:         local_closed = False
+673:         local_close_ts: float | None = None
+674:         idle_rounds = 0
+675:         last_activity = time.time()
+676:         poll_wait = max(0.02, poll_min_interval)
+677:         poll_ceiling = max(poll_wait, poll_max_interval)
+678:         eager_pulls = 0
+679:         next_pull_at = time.time()
+680:         ever_received_data = False
+681:         data_in_flight = False  # ensure only 1 data query in flight (ordering)
+682:         session_start = time.time()
+683: 
+684:         pool = ThreadPoolExecutor(max_workers=max(1, pipeline_depth))
+685:         pending = {}  # {future: (nonce, up_len)}
+686:         try:
+687:             while True:
+688:                 now = time.time()
+689:                 if idle_timeout > 0 and now - last_activity >= idle_timeout:
+690:                     break
+691:                 # Fast teardown after peer disconnect: avoid holding connection
+692:                 # slots for stale DNS in-flight work and improve reconnect latency.
+693:                 if local_closed and local_close_ts is not None and now - local_close_ts >= 1.5:
+694:                     break
+695:                 # Kill zombie sessions: no downstream data 4s after session start
+696:                 if not ever_received_data and now - session_start >= 4.0:
+697:                     log.info("forward zombie sid=%d: no downstream after %.1fs", sid, now - session_start)
+698:                     break
+699: 
+700:                 # --- Fill pipeline with new queries ---
+701:                 while len(pending) < pipeline_depth:
+702:                     outbound = b""
+703:                     if not local_closed and not data_in_flight:
+704:                         try:
+705:                             outbound = local_conn.recv(chunk_size)
+706:                             if outbound == b"":
+707:                                 local_closed = True
+708:                                 local_close_ts = time.time()
+709:                                 log.info("forward local closed sid=%d (clean FIN)", sid)
+710:                             elif outbound:
+711:                                 eager_pulls = max(eager_pulls, 4)
+712:                         except socket.timeout:
+713:                             outbound = b""
+714:                         except (ConnectionResetError, BrokenPipeError, OSError):
+715:                             local_closed = True
+716:                             local_close_ts = time.time()
+717:                             outbound = b""
+718:                             log.info("forward local closed sid=%d (connection reset)", sid)
+719: 
+720:                     now2 = time.time()
+721:                     should_send = bool(outbound) or now2 >= next_pull_at
+722:                     if not should_send:
+723:                         break
+724: 
+725:                     nonce = random_nonce()
+726:                     pkt = pack_packet(TYPE_STREAM_SEND, sid, nonce, outbound)
+727:                     fut = pool.submit(
+728:                         _query_txt, selector, port, zone, timeout,
+729:                         pkt, attempts, qtype,
+730:                     )
+731:                     pending[fut] = (nonce, len(outbound))
+732:                     if outbound:
+733:                         data_in_flight = True
+734:                         # Don't advance next_pull_at here: let companion poll
+735:                         # fire in the next fill-loop iteration so pipeline_depth
+736:                         # slots are actually used for downstream retrieval.
+737:                     else:
+738:                         next_pull_at = now2 + poll_wait
+739:                         break  # at most one empty poll per fill cycle
+740: 
+741:                 # --- Wait for results ---
+742:                 if not pending:
+743:                     time.sleep(min(0.05, max(0.0, next_pull_at - time.time())))
+744:                     continue
+745: 
+746:                 done_set, _ = _futures_wait(
+747:                     pending.keys(),
+748:                     return_when=FIRST_COMPLETED,
+749:                     timeout=min(
+750:                         timeout * max(1, attempts) + 3,
+751:                         max(0.8, timeout + 0.6) if local_closed else (timeout * max(1, attempts) + 3),
+752:                     ),
+753:                 )
+754:                 if not done_set:
+755:                     raise TimeoutError("all DNS queries timed out")
+756: 
+757:                 for f in done_set:
+758:                     exp_nonce, up_len = pending.pop(f)
+759:                     if up_len > 0:
+760:                         data_in_flight = False
+761:                     try:
+762:                         _, resp = f.result()
+763:                     except TimeoutError:
+764:                         for pf in pending:
+765:                             pf.cancel()
+766:                         pending.clear()
+767:                         raise
+768:                     log.info(
+769:                         "stream xfer sid=%d up=%d resp_type=%d resp_pay=%d",
+770:                         sid, up_len, resp.msg_type, len(resp.payload),
+771:                     )
+772:                     if resp.msg_type == TYPE_STREAM_CLOSE:
+773:                         log.info("server signalled stream close sid=%d", sid)
+774:                         local_closed = True
+775:                         local_close_ts = time.time()
+776:                         idle_rounds = 1  # force immediate exit
+777:                         try:
+778:                             local_conn.shutdown(socket.SHUT_RDWR)
+779:                         except OSError:
+780:                             pass
+781:                         break  # break from for-loop over done_set
+782:                     if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != exp_nonce:
+783:                         raise RuntimeError("stream recv mismatch")
+784: 
+785:                     seq, chunk = _extract_seq_chunk(resp.payload)
+786:                     got_new = False
+787:                     if seq is not None and chunk and seq not in seq_map:
+788:                         seq_map[seq] = chunk
+789:                         got_new = True
+790: 
+791:                     if len(resp.payload) > (1 + 2 + len(chunk if chunk else b"")):
+792:                         for mseq, mchunk in _extract_seq_chunks(resp.payload):
+793:                             if mseq not in seq_map:
+794:                                 seq_map[mseq] = mchunk
+795:                                 got_new = True
+796: 
+797:                     while len(seq_map) > SEQ_MAP_MAX_SIZE:
+798:                         seq_map.popitem(last=False)
+799: 
+800:                     while next_seq in seq_map:
+801:                         cdata = seq_map.pop(next_seq)
+802:                         try:
+803:                             local_conn.sendall(cdata)
+804:                         except (BrokenPipeError, ConnectionResetError, OSError):
+805:                             local_closed = True
+806:                             local_close_ts = time.time()
+807:                             break
+808:                         next_seq += 1
+809: 
+810:                     if got_new or up_len > 0:
+811:                         idle_rounds = 0
+812:                         last_activity = time.time()
+813:                         poll_wait = max(0.02, poll_min_interval)
+814:                         next_pull_at = time.time() + poll_wait
+815:                         if got_new:
+816:                             ever_received_data = True
+817:                     else:
+818:                         idle_rounds += 1
+819:                         if eager_pulls > 0:
+820:                             eager_pulls -= 1
+821:                             poll_wait = max(0.02, poll_min_interval)
+822:                         else:
+823:                             poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
+824:                         next_pull_at = time.time() + poll_wait
+825: 
+826:                 if local_closed and idle_rounds >= 1:
+827:                     break
+828:         finally:
+829:             for f in pending:
+830:                 f.cancel()
+831:             pool.shutdown(wait=False)
+832:             if local_closed:
+833:                 log.info("forward done %s sid=%s (local closed, idle_rounds=%d)", client_addr, sid, idle_rounds)
+834:             else:
+835:                 log.info("forward done %s sid=%s (idle timeout)", client_addr, sid)
+836: 
+837:     except TimeoutError as e:
+838:         log.warning("forward timeout %s sid=%s: %s", client_addr, sid, e)
+839:     except (BrokenPipeError, ConnectionResetError) as e:
+840:         log.info("forward pipe closed %s sid=%s: %s", client_addr, sid, e)
+841:     except OSError as e:
+842:         log.warning("forward os-error %s sid=%s: %s", client_addr, sid, e)
+843:     except Exception as e:
+844:         log.warning("forward error %s sid=%s: %s", client_addr, sid, e)
+845:     finally:
+846:         if sid is not None:
+847:             # Keep close best-effort and short to avoid reconnect delays when
+848:             # resolvers are unstable; server-side session TTL does final cleanup.
+849:             close_timeout = max(0.5, min(1.0, timeout * 0.5))
+850:             _stream_close(sid, selector, port, zone, close_timeout, 1, qtype)
+851:         try:
+852:             local_conn.close()
+853:         except Exception:
+854:             pass
+855: 
+856: 
+857: def run_forward_server(
+858:     selector: ResolverSelector,
+859:     port: int,
+860:     zone: str,
+861:     timeout: float,
+862:     attempts: int,
+863:     qtype: int,
+864:     listen_host: str,
+865:     listen_port: int,
+866:     target_host: str,
+867:     target_port: int,
+868:     chunk_size: int,
+869:     max_conns: int,
+870:     max_conns_per_ip: int,
+871:     stream_open_retries: int,
+872:     poll_min_interval: float,
+873:     poll_max_interval: float,
+874:     idle_timeout: float,
+875:     pipeline_depth: int = 1,
+876: ) -> None:
+877:     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+878:     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+879:     lsock.bind((listen_host, listen_port))
+880:     lsock.listen(256)
+881:     log.info(
+882:         "forward server listening on %s:%d -> %s:%d via resolvers=%s:%d",
+883:         listen_host, listen_port, target_host, target_port,
+884:         ','.join(selector.servers), port,
+885:     )
+886:     sem = threading.BoundedSemaphore(max(1, max_conns))
+887:     ip_counts: dict[str, int] = {}
+888:     ip_lock = Lock()
+889:     while True:
+890:         conn, addr = lsock.accept()
+891:         peer_ip = addr[0]
+892: 
+893:         if not sem.acquire(timeout=2.0):
+894:             log.warning("forward reject local=%s:%d reason=max_conns", peer_ip, addr[1])
+895:             try:
+896:                 conn.close()
+897:             except Exception:
+898:                 pass
+899:             continue
+900: 
+901:         # Track per-IP count for observability (no longer rejects).
+902:         with ip_lock:
+903:             ip_counts[peer_ip] = ip_counts.get(peer_ip, 0) + 1
+904: 
+905:         def _worker(
+906:             local_conn: socket.socket = conn,
+907:             local_addr: tuple[str, int] = addr,
+908:             local_peer_ip: str = peer_ip,
+909:         ) -> None:
+910:             try:
+911:                 _handle_forward_conn(
+912:                     local_conn,
+913:                     local_addr,
+914:                     selector,
+915:                     port,
+916:                     zone,
+917:                     timeout,
+918:                     attempts,
+919:                     qtype,
+920:                     target_host,
+921:                     target_port,
+922:                     chunk_size,
+923:                     stream_open_retries,
+924:                     poll_min_interval,
+925:                     poll_max_interval,
+926:                     idle_timeout,
+927:                     pipeline_depth,
+928:                 )
+929:             finally:
+930:                 with ip_lock:
+931:                     cur = ip_counts.get(local_peer_ip, 0) - 1
+932:                     if cur > 0:
+933:                         ip_counts[local_peer_ip] = cur
+934:                     else:
+935:                         ip_counts.pop(local_peer_ip, None)
+936:                 sem.release()
+937: 
+938:         t = threading.Thread(
+939:             target=_worker,
+940:             daemon=True,
+941:         )
+942:         t.start()
+943: 
+944: 
+945: def run_tcp_test(
+946:     selector: ResolverSelector,
+947:     port: int,
+948:     zone: str,
+949:     timeout: float,
+950:     attempts: int,
+951:     qtype: int,
+952:     target_host: str,
+953:     target_port: int,
+954:     request_data: str,
+955:     chunk_size: int,
+956: ) -> int:
+957:     sid = run_client(selector, port, zone, timeout, attempts, qtype)
+958: 
+959:     n1 = random_nonce()
+960:     open_pkt = pack_packet(
+961:         TYPE_STREAM_OPEN, sid, n1, f"{target_host}:{target_port}".encode("ascii")
+962:     )
+963:     _, op = _query_txt(selector, port, zone, timeout, open_pkt, attempts, qtype)
+964:     if op.msg_type != TYPE_STREAM_OPEN_ACK or op.nonce != n1 or op.payload != b"OK":
+965:         raise RuntimeError(f"stream open failed: {op.payload!r}")
+966:     log.info("stream open ok")
+967: 
+968:     req_bytes = request_data.encode("utf-8")
+969:     if chunk_size < 1:
+970:         chunk_size = len(req_bytes)
+971: 
+972:     recv_parts: "OrderedDict[int, bytes]" = OrderedDict()
+973: 
+974:     def _add_recv(payload: bytes) -> None:
+975:         if len(payload) < 3:
+976:             return
+977:         for seq, body in _extract_seq_chunks(payload):
+978:             if body and seq not in recv_parts:
+979:                 recv_parts[seq] = body
+980: 
+981:     for idx in range(0, len(req_bytes), chunk_size):
+982:         chunk = req_bytes[idx : idx + chunk_size]
+983:         n2 = random_nonce()
+984:         send_pkt = pack_packet(TYPE_STREAM_SEND, sid, n2, chunk)
+985:         _, rp = _query_txt(selector, port, zone, timeout, send_pkt, attempts, qtype)
+986:         if rp.msg_type != TYPE_STREAM_RECV or rp.nonce != n2:
+987:             raise RuntimeError("stream recv mismatch")
+988:         _add_recv(rp.payload)
+989: 
+990:     # Pull extra downstream data with empty sends.
+991:     empty_rounds = 0
+992:     for _ in range(20):
+993:         n4 = random_nonce()
+994:         pull_pkt = pack_packet(TYPE_STREAM_SEND, sid, n4, b"")
+995:         _, pr = _query_txt(selector, port, zone, timeout, pull_pkt, attempts, qtype)
+996:         if pr.msg_type != TYPE_STREAM_RECV or pr.nonce != n4:
+997:             raise RuntimeError("stream pull mismatch")
+998:         before = len(recv_parts)
+999:         _add_recv(pr.payload)
+1000:         if len(recv_parts) > before:
+1001:             empty_rounds = 0
+1002:         else:
+1003:             empty_rounds += 1
+1004:             if empty_rounds >= 2:
+1005:                 break
+1006:         time.sleep(0.08)
+1007: 
+1008:     recv_data = b"".join(recv_parts[k] for k in sorted(recv_parts.keys()))
+1009:     decoded = recv_data.decode("utf-8", errors="replace")
+1010:     log.info("stream recv (%d bytes):\n%s", len(recv_data), decoded)
+1011: 
+1012:     n3 = random_nonce()
+1013:     close_pkt = pack_packet(TYPE_STREAM_CLOSE, sid, n3, b"")
+1014:     _, cp = _query_txt(selector, port, zone, timeout, close_pkt, attempts, qtype)
+1015:     if cp.msg_type != TYPE_STREAM_CLOSE or cp.nonce != n3:
+1016:         raise RuntimeError("stream close mismatch")
+1017:     log.info("stream close ok")
+1018:     return sid
+1019: 
+1020: 
+1021: def main() -> None:
+1022:     logging.basicConfig(
+1023:         level=logging.INFO,
+1024:         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+1025:     )
+1026:     p = argparse.ArgumentParser(description="Nexora phase-1 client")
+1027:     p.add_argument(
+1028:         "--server",
+1029:         required=True,
+1030:         help="DNS server IP or comma-separated list of resolver IPs",
+1031:     )
+1032:     p.add_argument("--port", type=int, default=53)
+1033:     p.add_argument("--zone", required=True, help="example: t1.phonexpress.ir")
+1034:     p.add_argument("--timeout", type=float, default=2.0)
+1035:     p.add_argument("--attempts", type=int, default=3)
+1036:     p.add_argument("--qtype", choices=["TXT", "A"], default="TXT")
+1037:     p.add_argument("--tcp-test-host", default="")
+1038:     p.add_argument("--tcp-test-port", type=int, default=80)
+1039:     p.add_argument(
+1040:         "--tcp-test-request",
+1041:         default="GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+1042:     )
+1043:     p.add_argument("--tcp-chunk-size", type=int, default=100)
+1044:     p.add_argument("--forward-listen-host", default="")
+1045:     p.add_argument("--forward-listen-port", type=int, default=0)
+1046:     p.add_argument("--forward-target-host", default="")
+1047:     p.add_argument("--forward-target-port", type=int, default=0)
+1048:     p.add_argument("--forward-max-conns", type=int, default=4)
+1049:     p.add_argument("--forward-max-conns-per-ip", type=int, default=64)
+1050:     p.add_argument("--stream-open-retries", type=int, default=2)
+1051:     p.add_argument(
+1052:         "--dns-query-interval",
+1053:         type=float,
+1054:         default=0.05,
+1055:         help="minimum seconds between DNS queries (global rate limit)",
+1056:     )
+1057:     p.add_argument(
+1058:         "--forward-poll-min-interval",
+1059:         type=float,
+1060:         default=0.2,
+1061:         help="minimum delay between empty downstream polls (seconds)",
+1062:     )
+1063:     p.add_argument(
+1064:         "--forward-poll-max-interval",
+1065:         type=float,
+1066:         default=3.0,
+1067:         help="maximum delay between empty downstream polls under idle pressure (seconds)",
+1068:     )
+1069:     p.add_argument(
+1070:         "--forward-idle-timeout",
+1071:         type=float,
+1072:         default=15.0,
+1073:         help="close forward stream after this many idle seconds; 0 disables",
+1074:     )
+1075:     p.add_argument(
+1076:         "--pipeline-depth",
+1077:         type=int,
+1078:         default=0,
+1079:         help="concurrent DNS queries per stream; 0=auto (match resolver count)",
+1080:     )
+1081:     p.add_argument(
+1082:         "--resolver-file", default="",
+1083:         help="path to resolver JSON file (auto-updated by scanner)",
+1084:     )
+1085:     p.add_argument("--resolver-fail-cooldown", type=float, default=5)
+1086:     p.add_argument(
+1087:         "--resolver-max-inflight",
+1088:         type=int,
+1089:         default=2,
+1090:         help="max concurrent DNS queries per resolver candidate",
+1091:     )
+1092:     p.add_argument(
+1093:         "--resolver-attempt-cap",
+1094:         type=int,
+1095:         default=6,
+1096:         help="upper cap for auto attempts derived from resolver count",
+1097:     )
+1098:     p.add_argument("--resolver-health-interval", type=float, default=90.0)
+1099:     p.add_argument("--resolver-switch-interval", type=float, default=180.0)
+1100:     p.add_argument("--resolver-probe-timeout", type=float, default=1.6)
+1101:     p.add_argument("--resolver-probe-qtype", choices=["TXT", "A"], default="TXT")
+1102:     args = p.parse_args()
+1103:     qtype = TYPE_A if args.qtype == "A" else TYPE_TXT
+1104:     seed_resolvers = _sanitize_resolvers([x.strip() for x in args.server.split(",") if x.strip()])
+1105:     resolver_list = list(seed_resolvers)
+1106: 
+1107:     # Load resolvers from file (if present), with safety filtering and seed fallback.
+1108:     if args.resolver_file and os.path.isfile(args.resolver_file):
+1109:         try:
+1110:             with open(args.resolver_file, "r") as f:
+1111:                 data = json.load(f)
+1112:             file_resolvers = _sanitize_resolvers(data.get("resolver_list", []))
+1113:             if file_resolvers:
+1114:                 log.info("loaded %d resolvers from %s", len(file_resolvers), args.resolver_file)
+1115:                 resolver_list = file_resolvers
+1116:             else:
+1117:                 log.warning(
+1118:                     "resolver file %s has no usable public resolvers; using CLI seeds",
+1119:                     args.resolver_file,
+1120:                 )
+1121:         except Exception as e:
+1122:             log.warning("failed to read resolver file %s: %s, using CLI resolvers", args.resolver_file, e)
+1123: 
+1124:     if not resolver_list:
+1125:         raise RuntimeError("no usable public resolvers available (CLI + resolver file)")
+1126: 
+1127:     selector = ResolverSelector(
+1128:         resolver_list,
+1129:         fail_cooldown=args.resolver_fail_cooldown,
+1130:         max_inflight_per_resolver=args.resolver_max_inflight,
+1131:     )
+1132:     log.info("active resolvers (%d): %s", len(resolver_list), ", ".join(resolver_list))
+1133: 
+1134:     # Background watcher: reload resolvers when scanner updates the file
+1135:     if args.resolver_file:
+1136:         def _watch_resolver_file(path: str, sel: ResolverSelector) -> None:
+1137:             last_mtime = 0.0
+1138:             while True:
+1139:                 time.sleep(30)
+1140:                 try:
+1141:                     mtime = os.path.getmtime(path)
+1142:                     if mtime <= last_mtime:
+1143:                         continue
+1144:                     last_mtime = mtime
+1145:                     with open(path, "r") as f:
+1146:                         data = json.load(f)
+1147:                     new_list = _sanitize_resolvers(data.get("resolver_list", []))
+1148:                     if new_list:
+1149:                         if new_list != sel.servers:
+1150:                             sel.update_servers(new_list)
+1151:                     elif seed_resolvers and sel.servers != seed_resolvers:
+1152:                         log.warning(
+1153:                             "resolver file %s has no usable resolvers; falling back to CLI seeds",
+1154:                             path,
+1155:                         )
+1156:                         sel.update_servers(seed_resolvers)
+1157:                 except Exception:
+1158:                     pass
+1159: 
+1160:         wt = threading.Thread(
+1161:             target=_watch_resolver_file,
+1162:             args=(args.resolver_file, selector),
+1163:             daemon=True,
+1164:         )
+1165:         wt.start()
+1166:         log.info("resolver file watcher started: %s", args.resolver_file)
+1167:     global _dns_pacer
+1168:     _dns_pacer = _DnsQueryPacer(min_interval=args.dns_query_interval)
+1169:     # Auto pipeline depth: cap at 2 — keeps server load manageable and
+1170:     # avoids upstream data reordering (only 1 data query in flight).
+1171:     if args.pipeline_depth <= 0:
+1172:         args.pipeline_depth = max(1, min(2, len(resolver_list)))
+1173:         log.info("auto pipeline_depth=%d (from %d resolvers)", args.pipeline_depth, len(resolver_list))
+1174:     # Auto-scale attempts but keep a hard cap so one request won't block too long.
+1175:     cap = max(1, int(args.resolver_attempt_cap))
+1176:     target_attempts = min(len(resolver_list), cap)
+1177:     if target_attempts > args.attempts:
+1178:         args.attempts = target_attempts
+1179:         log.info(
+1180:             "auto attempts=%d (from %d resolvers, cap=%d)",
+1181:             args.attempts,
+1182:             len(resolver_list),
+1183:             cap,
+1184:         )
+1185:     probe_qtype = TYPE_A if args.resolver_probe_qtype == "A" else TYPE_TXT
+1186: 
+1187:     if len(resolver_list) > 1:
+1188:         def _probe(resolver_ip: str) -> bool:
+1189:             n = random_nonce()
+1190:             hello = pack_packet(TYPE_HELLO, 0, n, b"HP")
+1191:             _, pkt = _query_pkt_direct(
+1192:                 resolver_ip,
+1193:                 args.port,
+1194:                 args.zone,
+1195:                 args.resolver_probe_timeout,
+1196:                 hello,
+1197:                 probe_qtype,
+1198:             )
+1199:             return pkt.msg_type == TYPE_HELLO_ACK and pkt.nonce == n
+1200: 
+1201:         selector.start_background_health_loop(
+1202:             _probe,
+1203:             interval_sec=args.resolver_health_interval,
+1204:             switch_sec=args.resolver_switch_interval,
+1205:         )
+1206:         log.info(
+1207:             "resolver loop active=%s list=%s",
+1208:             selector.active, ','.join(selector.servers),
+1209:         )
+1210:     if args.forward_listen_port > 0 and args.forward_target_host and args.forward_target_port > 0:
+1211:         run_forward_server(
+1212:             selector,
+1213:             args.port,
+1214:             args.zone,
+1215:             args.timeout,
+1216:             args.attempts,
+1217:             qtype,
+1218:             args.forward_listen_host or "0.0.0.0",
+1219:             args.forward_listen_port,
+1220:             args.forward_target_host,
+1221:             args.forward_target_port,
+1222:             args.tcp_chunk_size,
+1223:             args.forward_max_conns,
+1224:             args.forward_max_conns_per_ip,
+1225:             args.stream_open_retries,
+1226:             args.forward_poll_min_interval,
+1227:             args.forward_poll_max_interval,
+1228:             args.forward_idle_timeout,
+1229:             args.pipeline_depth,
+1230:         )
+1231:     elif args.tcp_test_host:
+1232:         run_tcp_test(
+1233:             selector,
+1234:             args.port,
+1235:             args.zone,
+1236:             args.timeout,
+1237:             args.attempts,
+1238:             qtype,
+1239:             args.tcp_test_host,
+1240:             args.tcp_test_port,
+1241:             args.tcp_test_request,
+1242:             args.tcp_chunk_size,
+1243:         )
+1244:     else:
+1245:         run_client(selector, args.port, args.zone, args.timeout, args.attempts, qtype)
+1246: 
+1247: 
+1248: if __name__ == "__main__":
+1249:     main()

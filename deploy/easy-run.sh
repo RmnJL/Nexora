@@ -49,6 +49,12 @@ Client options:
   --resolver-attempt-cap N   default: 6
   --resolver-fail-cooldown   default: 5
   --resolver-max-inflight N  default: 1
+  --broadcast-enable         default: disabled
+  --broadcast-disable        default: disabled
+  --broadcast-fanout N       default: 10
+  --broadcast-timeout SEC    default: 0 (use --timeout)
+  --broadcast-per-resolver-timeout SEC default: 0 (use --timeout)
+  --kpi-summary-interval SEC default: 60 (<=0 disables)
   --resolver-health-interval default: 90
   --resolver-switch-interval default: 180
   --resolver-probe-timeout   default: 1.4
@@ -68,6 +74,7 @@ Client options:
   --poll-min-interval SEC    default: 0.12
   --poll-max-interval SEC    default: 3.0
   --idle-timeout SEC         default: 12
+  --zombie-grace-sec SEC     default: 8.0
 EOF
 }
 
@@ -138,6 +145,11 @@ install_client() {
   local resolver_attempt_cap="6"
   local resolver_fail_cooldown="5"
   local resolver_max_inflight="1"
+  local resolver_broadcast_flag=""
+  local resolver_broadcast_fanout="10"
+  local resolver_broadcast_timeout="0"
+  local resolver_broadcast_per_resolver_timeout="0"
+  local kpi_summary_interval="60"
   local resolver_health_interval="90"
   local resolver_switch_interval="180"
   local resolver_probe_timeout="1.4"
@@ -157,6 +169,7 @@ install_client() {
   local poll_min_interval="0.12"
   local poll_max_interval="3.0"
   local idle_timeout="12"
+  local zombie_grace_sec="8.0"
   local client_py="/root/nexora/src/nexora_client.py"
 
   while [[ $# -gt 0 ]]; do
@@ -170,6 +183,12 @@ install_client() {
       --resolver-attempt-cap) resolver_attempt_cap="${2:?}"; shift 2 ;;
       --resolver-fail-cooldown) resolver_fail_cooldown="${2:?}"; shift 2 ;;
       --resolver-max-inflight) resolver_max_inflight="${2:?}"; shift 2 ;;
+      --broadcast-enable) resolver_broadcast_flag="--resolver-broadcast"; shift 1 ;;
+      --broadcast-disable) resolver_broadcast_flag=""; shift 1 ;;
+      --broadcast-fanout) resolver_broadcast_fanout="${2:?}"; shift 2 ;;
+      --broadcast-timeout) resolver_broadcast_timeout="${2:?}"; shift 2 ;;
+      --broadcast-per-resolver-timeout) resolver_broadcast_per_resolver_timeout="${2:?}"; shift 2 ;;
+      --kpi-summary-interval) kpi_summary_interval="${2:?}"; shift 2 ;;
       --resolver-health-interval) resolver_health_interval="${2:?}"; shift 2 ;;
       --resolver-switch-interval) resolver_switch_interval="${2:?}"; shift 2 ;;
       --resolver-probe-timeout) resolver_probe_timeout="${2:?}"; shift 2 ;;
@@ -189,6 +208,7 @@ install_client() {
       --poll-min-interval) poll_min_interval="${2:?}"; shift 2 ;;
       --poll-max-interval) poll_max_interval="${2:?}"; shift 2 ;;
       --idle-timeout) idle_timeout="${2:?}"; shift 2 ;;
+      --zombie-grace-sec) zombie_grace_sec="${2:?}"; shift 2 ;;
       *) echo "Unknown option for client: $1"; usage; exit 1 ;;
     esac
   done
@@ -211,6 +231,11 @@ NEXORA_ATTEMPTS=${attempts}
 NEXORA_RESOLVER_ATTEMPT_CAP=${resolver_attempt_cap}
 NEXORA_RESOLVER_FAIL_COOLDOWN=${resolver_fail_cooldown}
 NEXORA_RESOLVER_MAX_INFLIGHT=${resolver_max_inflight}
+NEXORA_RESOLVER_BROADCAST_FLAG=${resolver_broadcast_flag}
+NEXORA_RESOLVER_BROADCAST_FANOUT=${resolver_broadcast_fanout}
+NEXORA_RESOLVER_BROADCAST_TIMEOUT=${resolver_broadcast_timeout}
+NEXORA_RESOLVER_BROADCAST_PER_RESOLVER_TIMEOUT=${resolver_broadcast_per_resolver_timeout}
+NEXORA_KPI_SUMMARY_INTERVAL=${kpi_summary_interval}
 NEXORA_RESOLVER_HEALTH_INTERVAL=${resolver_health_interval}
 NEXORA_RESOLVER_SWITCH_INTERVAL=${resolver_switch_interval}
 NEXORA_RESOLVER_PROBE_TIMEOUT=${resolver_probe_timeout}
@@ -230,6 +255,7 @@ NEXORA_DNS_QUERY_INTERVAL=${dns_query_interval}
 NEXORA_FORWARD_POLL_MIN_INTERVAL=${poll_min_interval}
 NEXORA_FORWARD_POLL_MAX_INTERVAL=${poll_max_interval}
 NEXORA_FORWARD_IDLE_TIMEOUT=${idle_timeout}
+NEXORA_FORWARD_ZOMBIE_GRACE_SEC=${zombie_grace_sec}
 EOF
   echo "[easy-run] installed ${CLIENT_UNIT_DST}"
   echo "[easy-run] wrote ${CLIENT_ENV}"
