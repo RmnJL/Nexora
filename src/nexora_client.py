@@ -378,6 +378,8 @@ class ResolverSelector:
         self._order: dict[str, int] = {s: i for i, s in enumerate(uniq)}
         self._timeout_streak: dict[str, int] = {s: 0 for s in uniq}
         self._max_inflight_per_resolver = max(1, max_inflight_per_resolver)
+        self._max_inflight_broadcast = max(2, max_inflight_per_resolver * 5)  # 5x for broadcast
+        self._is_broadcast_mode = False  # Dynamic flag for broadcast context
         self._ewma_alpha = min(0.8, max(0.05, ewma_alpha))
         self._fail_streak_before_blacklist = max(1, int(fail_streak_before_blacklist))
         self._inflight: dict[str, int] = {s: 0 for s in uniq}
@@ -417,16 +419,22 @@ class ResolverSelector:
                 self._set_active_locked(preferred)
             return self._active
 
-    def choose_next(self, exclude: set | None = None) -> str | None:
-        """Sticky active resolver with fallback only when active is unusable."""
+    def choose_next(self, exclude: set | None = None, broadcast_mode: bool = False) -> str | None:
+        """Sticky active resolver with fallback only when active is unusable.
+        
+        Args:
+            exclude: Set of resolvers to exclude
+            broadcast_mode: If True, use higher inflight limit (broadcast context)
+        """
         now = time.time()
         with self._lock:
             excluded = exclude or set()
             active = self._active
             active_bad = now < self._bad_until.get(active, 0.0)
-            active_at_cap = (
-                self._inflight.get(active, 0) >= self._max_inflight_per_resolver
-            )
+            
+            # Select inflight limit based on mode
+            limit = self._max_inflight_broadcast if broadcast_mode else self._max_inflight_per_resolver
+            active_at_cap = self._inflight.get(active, 0) >= limit
 
             # Keep using the current resolver while it is healthy.
             if (not active_bad) and (active not in excluded) and (not active_at_cap):
@@ -438,7 +446,7 @@ class ResolverSelector:
                 for s in self._servers
                 if s != active
                 and now >= self._bad_until.get(s, 0.0)
-                and self._inflight.get(s, 0) < self._max_inflight_per_resolver
+                and self._inflight.get(s, 0) < limit
                 and s not in excluded
             ]
             if not pool:
@@ -457,7 +465,7 @@ class ResolverSelector:
                     s
                     for s in self._servers
                     if s != active
-                    and self._inflight.get(s, 0) < self._max_inflight_per_resolver
+                    and self._inflight.get(s, 0) < limit
                     and s not in excluded
                 ]
             if not pool:
@@ -736,8 +744,8 @@ _resolver_last_chance_fallback: bool = True
 _resolver_parallel_fallback: bool = True
 _resolver_broadcast_enabled: bool = False
 _resolver_broadcast_fanout: int = 10
-_resolver_broadcast_timeout: float = 0.0
-_resolver_broadcast_per_resolver_timeout: float = 0.0
+_resolver_broadcast_timeout: float = 2.8  # Total broadcast timeout (must be < client timeout)
+_resolver_broadcast_per_resolver_timeout: float = 1.2  # Per-resolver timeout
 _kpi_summary_interval_sec: float = 60.0
 _kpi_summary_started: bool = False
 _runtime_kpi = _RuntimeKpi()
@@ -919,7 +927,7 @@ def _query_txt(
         time.sleep(wait_s)
 
     for idx in range(total_attempts):
-        server = selector.choose_next(exclude=dead_servers)
+        server = selector.choose_next(exclude=dead_servers, broadcast_mode=False)
         if server is None:
             # No usable resolver left for this query - bail early.
             break
@@ -929,7 +937,7 @@ def _query_txt(
         if _resolver_broadcast_enabled and broadcast_fanout > 1:
             chosen = [server]
             while len(chosen) < broadcast_fanout:
-                nxt = selector.choose_next(exclude=dead_servers | set(chosen))
+                nxt = selector.choose_next(exclude=dead_servers | set(chosen), broadcast_mode=True)
                 if nxt is None:
                     break
                 chosen.append(nxt)
@@ -1464,8 +1472,16 @@ def _handle_forward_conn(
                 if not done_set:
                     raise TimeoutError("all DNS queries timed out")
 
+                # Fix #4: Accumulate all results before breaking
+                # This prevents losing success metrics when multiple futures complete
+                pop_keys = []
                 for f in done_set:
-                    exp_nonce, up_len = pending.pop(f)
+                    exp_nonce, up_len = pending.get(f)
+                    if exp_nonce is None:
+                        continue
+                    
+                    pop_keys.append(f)
+                    
                     if up_len > 0:
                         data_in_flight = False
                     try:
@@ -1479,11 +1495,14 @@ def _handle_forward_conn(
                             exp_nonce,
                             up_len,
                         )
+                        pending.pop(f, None)
                         continue
+                    
                     log.info(
                         "stream xfer sid=%d up=%d resp_type=%d resp_pay=%d",
                         sid, up_len, resp.msg_type, len(resp.payload),
                     )
+                    
                     if resp.msg_type == TYPE_STREAM_CLOSE:
                         log.info("server signalled stream close sid=%d", sid)
                         local_closed = True
@@ -1493,8 +1512,11 @@ def _handle_forward_conn(
                             local_conn.shutdown(socket.SHUT_RDWR)
                         except OSError:
                             pass
+                        pending.pop(f, None)
                         break  # break from for-loop over done_set
+                    
                     if resp.msg_type != TYPE_STREAM_RECV or resp.nonce != exp_nonce:
+                        pending.pop(f, None)
                         raise RuntimeError("stream recv mismatch")
 
                     seq, chunk = _extract_seq_chunk(resp.payload)
@@ -1541,6 +1563,12 @@ def _handle_forward_conn(
                         else:
                             poll_wait = min(poll_ceiling, max(0.02, poll_wait * 1.8))
                         next_pull_at = time.time() + poll_wait
+                    
+                    pending.pop(f, None)
+                
+                # Remove all processed keys at once
+                for key in pop_keys:
+                    pending.pop(key, None)
 
                 if local_closed and idle_rounds >= 1:
                     break

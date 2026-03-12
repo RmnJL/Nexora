@@ -161,14 +161,17 @@ class BroadcastQueryManager:
                      resolvers: list) -> Tuple[int, object]:
         """
         Internal: Execute parallel broadcast queries.
+        Reports success/failure to ResolverSelector for quality learning.
         """
         executor = ThreadPoolExecutor(max_workers=len(resolvers))
         futures = {}
+        sent_at: dict = {}
         start_time = time.time()
         
         try:
             # Launch all queries
             for resolver in resolvers:
+                sent_at[resolver] = time.time()
                 future = executor.submit(
                     self._query_single_resolver,
                     resolver, packet, zone, qtype, port, expected_nonce
@@ -179,6 +182,12 @@ class BroadcastQueryManager:
             while True:
                 elapsed = time.time() - start_time
                 if elapsed > self.broadcast_timeout:
+                    # All timed out - report failures
+                    for resolver in resolvers:
+                        self.selector.report_failure(
+                            resolver,
+                            latency_ms=(time.time() - sent_at.get(resolver, start_time)) * 1000.0
+                        )
                     log.warning(f"Broadcast timeout after {elapsed:.2f}s, "
                                f"all {len(resolvers)} resolvers failed")
                     raise TimeoutError(
@@ -210,21 +219,42 @@ class BroadcastQueryManager:
                             with self._lock:
                                 self._broadcast_successes += 1
                             
+                            # Report success for this resolver
+                            self.selector.report_success(
+                                resolver,
+                                latency_ms=(time.time() - sent_at[resolver]) * 1000.0
+                            )
+                            
                             log.info(f"Broadcast success: nonce={expected_nonce} "
                                    f"resolver={resolver} elapsed={elapsed:.3f}s")
                             
-                            # Cancel all pending
+                            # Cancel all pending and report their failures
                             for f in futures:
-                                f.cancel()
+                                if not f.done():
+                                    f.cancel()
+                                    failed_resolver = futures[f]
+                                    self.selector.report_failure(
+                                        failed_resolver,
+                                        latency_ms=(time.time() - sent_at.get(failed_resolver, start_time)) * 1000.0
+                                    )
                             
                             return qid, response_packet
                         else:
                             log.debug(f"Response nonce mismatch from {resolver}: "
                                     f"expected {expected_nonce}, "
                                     f"got {response_packet.nonce}")
+                            # Report as failure for nonce mismatch
+                            self.selector.report_failure(
+                                resolver,
+                                latency_ms=(time.time() - sent_at[resolver]) * 1000.0
+                            )
                     
                     except Exception as e:
                         log.debug(f"Query from {resolver} failed: {e}")
+                        self.selector.report_failure(
+                            resolver,
+                            latency_ms=(time.time() - sent_at.get(resolver, start_time)) * 1000.0
+                        )
                 
                 # Check if all done futures processed
                 if len([f for f in futures if f.done()]) == len(futures):
@@ -290,26 +320,36 @@ class BroadcastQueryManager:
     def _select_diverse_resolvers(self, exclude: Optional[Set[str]] = None) -> list:
         """
         Select N diverse resolvers from active pool.
-        Prefer healthy resolvers, skip excluded ones.
+        Prioritize healthy resolvers based on quality scores, skip excluded ones.
         """
-        import random
-        
         exclude = exclude or set()
         
         # Get all resolvers
         all_resolvers = self.selector.servers
         
-        # Filter
+        # Filter available candidates
         candidates = [r for r in all_resolvers if r not in exclude]
         if not candidates:
             candidates = all_resolvers
         
-        # Shuffle for diversity
-        shuffled = list(candidates)
-        random.shuffle(shuffled)
+        # Score candidates by health (prefer working resolvers)
+        # Each resolver tracks: success_rate, latency, failure_streak
+        candidates_scored = []
+        for resolver in candidates:
+            # Get health metrics from selector
+            success_rate = self.selector._success_ewma.get(resolver, 0.5)
+            latency = self.selector._latency_ewma_ms.get(resolver, 700.0)
+            fail_streak = self.selector._soft_fail_streak.get(resolver, 0)
+            
+            # Quality score: prefer high success, low latency, low failures
+            quality_score = success_rate - (latency / 1000.0) - (fail_streak * 0.1)
+            candidates_scored.append((resolver, quality_score))
         
-        # Select N
-        selected = shuffled[:min(self.num_parallel, len(shuffled))]
+        # Sort by quality (higher is better)
+        candidates_scored.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select top N
+        selected = [r[0] for r in candidates_scored[:min(self.num_parallel, len(candidates_scored))]]
         
         return selected
     
