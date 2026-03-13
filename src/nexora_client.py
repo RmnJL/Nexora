@@ -336,10 +336,16 @@ def _extract_resolvers_from_scan_json(
             seen.add(ip)
             filtered.append(ip)
 
-    # If scanner rows exist, prefer strict filtering, but do not collapse to
-    # an empty set when scanner publishes fallback-only rows.
+    # If scanner rows exist, prefer strict filtering. When scanner explicitly
+    # reports zero working rows, do not consume flattened resolver_list
+    # because it may contain degraded fallback entries.
     if isinstance(rows, list) and rows:
-        return filtered if filtered else fallback_list
+        if filtered:
+            return filtered
+        total_working = data.get("total_working")
+        if isinstance(total_working, (int, float)) and int(total_working) <= 0:
+            return []
+        return fallback_list
     # Compatibility fallback for very old scanner JSON schema.
     return fallback_list
 

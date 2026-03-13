@@ -150,6 +150,25 @@ class TestResolverFileFiltering(unittest.TestCase):
         )
         self.assertEqual(got, ["8.8.8.8", "1.1.1.1"])
 
+    def test_no_fallback_when_scanner_reports_zero_working(self):
+        row = self._base_row("1.1.1.1")
+        row["bidirectional"] = False
+        data = {
+            "resolvers": [row],
+            "resolver_list": ["8.8.8.8", "1.1.1.1"],
+            "total_working": 0,
+        }
+        got = _extract_resolvers_from_scan_json(
+            data,
+            min_pass_rate=0.8,
+            max_latency_ms=500.0,
+            min_score=4.0,
+            max_consecutive_failures=1,
+            max_stale_sec=300.0,
+            allowed_pools={"active", "standby"},
+        )
+        self.assertEqual(got, [])
+
     def test_fallback_to_resolver_list_when_rows_key_absent(self):
         data = {"resolver_list": ["8.8.8.8", "1.1.1.1"]}
         got = _extract_resolvers_from_scan_json(
