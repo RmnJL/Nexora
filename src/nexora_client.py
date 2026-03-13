@@ -293,6 +293,9 @@ def _extract_resolvers_from_scan_json(
             proto_roundtrip = row.get("protocol_roundtrip")
             if proto_roundtrip is False:
                 continue
+            stream_roundtrip = row.get("stream_roundtrip")
+            if stream_roundtrip is False:
+                continue
 
             try:
                 pass_rate = float(row.get("runtime_pass_rate"))

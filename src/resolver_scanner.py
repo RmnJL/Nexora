@@ -709,6 +709,7 @@ def _is_working_result(r: ProbeResult) -> bool:
         and r.tunnel_realistic
         and r.bidirectional
         and r.protocol_roundtrip
+        and r.stream_roundtrip
     )
 
 
