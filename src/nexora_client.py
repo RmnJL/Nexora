@@ -261,9 +261,11 @@ def _extract_resolvers_from_scan_json(
 ) -> list[str]:
     """Prefer quality-filtered resolver rows from scanner JSON.
 
-    Falls back to resolver_list only when quality rows are not present.
+    Falls back to resolver_list when strict quality rows are absent or
+    temporarily all filtered out.
     """
     rows = data.get("resolvers", [])
+    fallback_list = _sanitize_resolvers(data.get("resolver_list", []))
     filtered: list[str] = []
     seen: set[str] = set()
     now_ts = time.time()
@@ -334,11 +336,12 @@ def _extract_resolvers_from_scan_json(
             seen.add(ip)
             filtered.append(ip)
 
-    # If scanner rows exist, trust strict filtering result (even empty).
+    # If scanner rows exist, prefer strict filtering, but do not collapse to
+    # an empty set when scanner publishes fallback-only rows.
     if isinstance(rows, list) and rows:
-        return filtered
+        return filtered if filtered else fallback_list
     # Compatibility fallback for very old scanner JSON schema.
-    return _sanitize_resolvers(data.get("resolver_list", []))
+    return fallback_list
 
 
 def _ensure_min_resolver_count(

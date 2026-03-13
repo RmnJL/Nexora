@@ -132,7 +132,7 @@ class TestResolverFileFiltering(unittest.TestCase):
         )
         self.assertEqual(got, [])
 
-    def test_no_fallback_to_resolver_list_when_rows_exist_but_all_bad(self):
+    def test_fallback_to_resolver_list_when_rows_exist_but_all_bad(self):
         row = self._base_row("1.1.1.1")
         row["bidirectional"] = False
         data = {
@@ -148,7 +148,7 @@ class TestResolverFileFiltering(unittest.TestCase):
             max_stale_sec=300.0,
             allowed_pools={"active", "standby"},
         )
-        self.assertEqual(got, [])
+        self.assertEqual(got, ["8.8.8.8", "1.1.1.1"])
 
     def test_fallback_to_resolver_list_when_rows_key_absent(self):
         data = {"resolver_list": ["8.8.8.8", "1.1.1.1"]}
